@@ -33,17 +33,20 @@ paicli/
 │   ├── chapter1-ReAct和Tool Call实现.md
 │   └── chapter2-Plan-and-Execute实现.md
 └── src/main/java/com/paicli/
-    ├── cli/Main.java                  # CLI 入口 + REPL + API Key 加载
+    ├── cli/
+    │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由
+    │   ├── CliCommandParser.java      # 命令解析（/plan /exit /clear）
+    │   └── PlanReviewInputParser.java # 审查输入解析（EXECUTE/SUPPLEMENT/CANCEL）
     ├── agent/
     │   ├── Agent.java                 # ReAct 循环（思考-行动-观察）
-    │   └── PlanExecuteAgent.java      # Plan-and-Execute 编排
+    │   └── PlanExecuteAgent.java      # Plan-and-Execute 编排 + 计划审查
     ├── llm/
     │   └── GLMClient.java             # GLM HTTP 客户端 + Message/Tool/ToolCall record
     ├── tool/
     │   └── ToolRegistry.java          # 5 个内置工具 + JSON Schema 生成 + 工具执行
     └── plan/
         ├── Planner.java               # LLM 驱动的任务分解
-        ├── ExecutionPlan.java         # 计划 DAG + 拓扑排序
+        ├── ExecutionPlan.java         # 计划 DAG + 拓扑排序 + 批次计算
         └── Task.java                  # 任务节点 + 依赖/状态
 ```
 
@@ -68,9 +71,9 @@ paicli/
            └──────────┘         └────────────┘       └────────────┘
 ```
 
-**两种执行模式**（`PlanExecuteAgent.shouldPlan()` 启发式判断）：
-- 简单任务（动作关键词 < 3 且输入 ≤ 50 字）：直接走 ReAct 单轮工具调用
-- 复杂任务：`Planner.createPlan()` → `ExecutionPlan.computeExecutionOrder()` → 按 DAG 顺序执行每个 `Task` → 失败进度 < 50% 时触发 `Planner.replan()`
+**两种执行模式**（CLI 层通过 `/plan` 命令切换）：
+- **ReAct 模式**（默认）：`Agent.run()` 循环调用 LLM + 工具
+- **Plan 模式**（`/plan` 触发）：`PlanExecuteAgent.run()` → `Planner.createPlan()` → 计划审查（HITL）→ 分批并发执行 → 失败进度 < 50% 时触发 `Planner.replan()`
 
 ---
 
@@ -80,15 +83,19 @@ paicli/
 
 ### 4.1 `cli.Main` — CLI 入口（第 1 期基础，第 2 期增强）
 
-- 文件：`src/main/java/com/paicli/cli/Main.java`、`src/main/java/com/paicli/cli/CliCommandParser.java`
+- 文件：`src/main/java/com/paicli/cli/Main.java`、`src/main/java/com/paicli/cli/CliCommandParser.java`、`src/main/java/com/paicli/cli/PlanReviewInputParser.java`
 - 职责：
   - 启动 banner 打印
   - API Key 加载顺序：当前目录 `.env` → `~/.env` → 环境变量 `GLM_API_KEY`
-  - 支持 `/react`、`/plan` 命令运行时切换执行模式
+  - **JLine 终端控制**：raw mode 单键读取、括号粘贴处理、ESC 序列 draining
+  - **模式路由**：`/plan` 命令或 `/plan <content>` 切换到 Plan 模式，执行完毕后自动回到 ReAct
+  - **计划审查**：通过 `createPlanReviewHandler()` 注入 `PlanReviewHandler`，实现 Enter/Ctrl+O/ESC/I 四种交互
+  - **预填机制**：Plan 模式输入前 raw mode 预读首字符，支持 ESC 取消和粘贴多行文本
   - ReAct 模式：`Agent.run()` 循环调用 LLM + 工具
   - Plan 模式：`PlanExecuteAgent.run()` 先规划后执行
   - 其他命令：`exit`/`quit` 退出、`clear` 清空历史
 - 关键约定：API Key 找不到时直接 `System.exit(1)`，不进入交互循环
+- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 8 节
 
 ### 4.2 `agent.Agent` — ReAct 循环（第 1 期）
 
@@ -133,33 +140,49 @@ paicli/
 ### 4.5 `agent.PlanExecuteAgent` — Plan-and-Execute 编排（第 2 期）
 
 - 文件：`src/main/java/com/paicli/agent/PlanExecuteAgent.java`
-- 职责：模式路由 + 计划执行编排
+- 职责：计划执行编排 + HITL 审查流程
 - 关键设计：
-  - `shouldPlan(input)` 用启发式规则（动作关键词 ≥ 3 或输入 > 50 字）判断是否走 Plan 路径
-  - 简单任务 → `runSimple()` 单轮 LLM + 工具调用
-  - 复杂任务 → `runWithPlan()` → `Planner.createPlan()` → `executePlan()` 按拓扑序执行
-  - `executeTask()` 每个 Task 独立调 LLM，不维护跨 Task 对话历史；依赖通过 `buildTaskContext()` 注入
-  - `executePlan()` 中失败 + 进度 < 50% 时触发 `Planner.replan()`
-- 详见 `docs/chapter2-Plan-and-Execute实现.md`
+  - **模式路由由 CLI 层负责**：`run()` 直接走 `runWithPlan()`，不再用 `shouldPlan()` 启发式判断
+  - **计划审查**：`reviewAndExecutePlan()` 调用注入的 `PlanReviewHandler.review()`，支持 EXECUTE/SUPPLEMENT/CANCEL 三种决策
+    - SUPPLEMENT 时将补充要求拼接到原 goal，重新 `planner.createPlan()` 并再次审查
+    - 用户可多次补充要求，直到满意或放弃
+  - **分批并发执行**：`executePlan()` 用 `while(true) + getExecutableTasksInOrder()` 逐轮计算可执行任务
+    - 单任务：直接在当前线程执行
+    - 多任务：用 `ExecutorService` 线程池并行执行（前提是同批次内任务互不依赖）
+    - 僵局检测：while 退出但计划未完成且无失败 → 存在无法满足的依赖
+  - **executeTask()**：每个 Task 独立调 LLM，不维护跨 Task 对话历史；依赖通过 `buildTaskContext()` 注入
+  - **失败恢复**：失败 + 进度 < 50% 时触发 `Planner.replan()`
+- 内部类型：`TaskExecutionResult`（封装成功/失败结果）、`PlanReviewHandler`（审查回调接口）、`PlanReviewAction`（EXECUTE/SUPPLEMENT/CANCEL）、`PlanReviewDecision`（决策 + 补充说明）
+- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 6、7、9 节
 
 ### 4.6 `plan.Planner` — LLM 任务分解（第 2 期）
 
-- 文件：`src/main/java/com/paicli/plan/Planner.java`
+- 文件：`src/main/java/com/pacicli/plan/Planner.java`
 - 职责：用 `PLANNING_PROMPT` 让 LLM 输出 `{summary, tasks:[{id,description,type,dependencies}]}` JSON
 - 解析流程：
   1. 去除 ```` ```json ```` / ```` ``` ```` markdown 包裹
   2. 两遍扫描：先建 Task 节点（处理前向引用），再回填 dependencies
   3. `idMapping` 重写为 `task_1, task_2, ...` 避免 LLM 给的 id 重复
   4. 调 `ExecutionPlan.computeExecutionOrder()` 做拓扑排序，有环抛异常
-- `replan(failedPlan, reason)`：把已完成任务作为上下文重新调 `createPlan`
+- `replan(failedPlan, reason)`：把已完成任务列表和失败原因作为上下文重新调 `createPlan()`
+  - 用于 `executePlan()` 中失败 + 进度 < 50% 时触发重规划
+  - 也用于 `reviewAndExecutePlan()` 中用户补充要求后重新规划
+- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 3 节
 
 ### 4.7 `plan.ExecutionPlan` — 计划 DAG（第 2 期）
 
-- 文件：`src/main/java/com/paicli/plan/ExecutionPlan.java`
+- 文件：`src/main/java/com/pacicli/plan/ExecutionPlan.java`
 - `LinkedHashMap<id, Task>` 保持插入顺序；`executionOrder` 存拓扑序
 - `computeExecutionOrder()` 用 DFS + `visiting/visited` 双集合（三色标记法）检测环
+  - 后序遍历保证被依赖节点先加入，依赖节点后加入
+  - 环检测：DFS 递归栈中再次遇到同一节点 → 后向边 → 有环
 - `getProgress()` 返回完成比例（用于判断是否触发 replan，阈值 50%）
+- `getExecutionBatches()` 模拟执行过程，计算 DAG 可分成几批并发执行
+  - 每批：所有依赖都已完成（即 `isExecutable==true`）的任务
+  - 用于 `summarize()` 显示并行批次数
 - `visualize()` 输出 ASCII 表格（含状态 emoji ⏳▶️✅❌⏭️）
+- `summarize()` 输出折叠摘要（任务数、并行批次、当前可执行、首批/最终收敛任务）
+- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 4 节
 
 ### 4.8 `plan.Task` — 任务节点（第 2 期）
 
@@ -190,7 +213,7 @@ java -jar target/paicli-0.0.1-SNAPSHOT.jar
 
 ### 5.3 测试
 
-当前还没有单元测试。ROADMAP 中后续期次会引入 `mvn test`。第 6 期以后的所有危险操作（write_file / execute_command / create_project）需走 HITL 审批（未实现）。
+当前还没有单元测试。ROADMAP 中后续期次会引入 `mvn test`。第 6 期将实现危险操作（write_file / execute_command / create_project）的 HITL 审批，第 2 期已实现计划生成的 HITL 审查。
 
 ---
 
@@ -201,8 +224,8 @@ java -jar target/paicli-0.0.1-SNAPSHOT.jar
 | 3 | Memory 系统 | `MemoryManager` / `ContextProfile` | 未开始 |
 | 4 | RAG 检索 | `VectorStore` / `CodeIndexer` | 未开始 |
 | 5 | Multi-Agent | `AgentOrchestrator` / `SubAgent` | 未开始 |
-| 6 | HITL 审批 | `HitlToolRegistry` / `PathGuard` / `CommandGuard` / `AuditLog` | 未开始 |
-| 7 | 异步并行 | `BatchToolExecutor` | 未开始 |
+| 6 | HITL 审批 | `HitlToolRegistry` / `PathGuard` / `CommandGuard` / `AuditLog` | 部分实现（第 2 期已有计划审查 HITL，第 6 期补充危险操作审批） |
+| 7 | 异步并行 | `BatchToolExecutor` | 部分实现（第 2 期已有分批并行执行，第 7 期补充更高级的异步调度） |
 | 8 | 多模型 | `LlmClient` 接口 / `AbstractOpenAiCompatibleClient` / `DeepSeekClient` / `StepClient` / `KimiClient` | 未开始 |
 | 9 | 联网工具 | `web_search` / `web_fetch` | 未开始 |
 | 10–11 | MCP | `JsonRpcClient` / `McpTransport` / `McpServerManager` | 未开始 |

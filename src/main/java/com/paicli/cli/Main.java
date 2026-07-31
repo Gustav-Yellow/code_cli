@@ -2,20 +2,76 @@ package com.paicli.cli;
 
 import com.paicli.agent.Agent;
 import com.paicli.agent.PlanExecuteAgent;
+import com.paicli.plan.ExecutionPlan;
+import org.jline.terminal.Terminal;
+import org.jline.terminal.TerminalBuilder;
+import org.jline.terminal.Attributes;
+import org.jline.reader.LineReader;
+import org.jline.reader.LineReaderBuilder;
+import org.jline.reader.MaskingCallback;
+import org.jline.reader.EndOfFileException;
+import org.jline.reader.UserInterruptException;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
-import java.util.Scanner;
 
 /**
- * PaiCLI v2.0 - Plan-and-Execute Agent CLI
- * 支持 ReAct 和 Plan-and-Execute 两种模式
+ * PaiCLI v2.0 — Plan-and-Execute Agent CLI。
+ *
+ * <h3>模式路由</h3>
+ * 默认使用 ReAct（Agent.java），用户通过 /plan 命令切换到 Plan-and-Execute 模式：
+ * <ul>
+ *   <li>/plan → 下一条输入走 Plan 模式，执行完毕后自动回到 ReAct</li>
+ *   <li>/plan 任务内容 → 直接用 Plan 模式执行该任务</li>
+ * </ul>
+ *
+ * <h3>JLine 终端</h3>
+ * 使用 JLine 替代 Scanner，支持 raw mode 单键读取（计划审查）、括号粘贴、Ctrl+C/D 处理。
  */
 public class Main {
     private static final String VERSION = "2.0.0";
     private static final String ENV_FILE = ".env";
+
+    /** 终端括号粘贴模式的前缀标记（xterm 扩展） */
+    private static final String BRACKETED_PASTE_BEGIN = "[200~";
+    /** 终端括号粘贴模式的后缀标记 */
+    private static final String BRACKETED_PASTE_END = "\u001b[201~";
+    /** Ctrl+O 的 ASCII 码，用于展开完整计划视图 */
+    private static final int CTRL_O = 15;
+
+    /**
+     * readPromptInput 的返回值 —— text 是用户输入内容，canceled 表示用户按 ESC 取消。
+     */
+    private record PromptInput(String text, boolean canceled) {
+        static PromptInput submitted(String text) {
+            return new PromptInput(text, false);
+        }
+
+        static PromptInput canceledInput() {
+            return new PromptInput("", true);
+        }
+    }
+
+    /**
+     * readPrefillInputFromTerminal 的返回值 —— 解析 raw mode 下第一个按键的意图。
+     * seedBuffer 非空 → 用户开始输入，buffer 作为 LineReader 的预填内容；
+     * canceled → 用户按了 ESC；submitted → 用户直接按了回车（空输入）。
+     */
+    private record PrefillResult(String seedBuffer, boolean canceled, boolean submitted) {
+        static PrefillResult canceledInput() {
+            return new PrefillResult("", true, false);
+        }
+
+        static PrefillResult submittedInput() {
+            return new PrefillResult("", false, true);
+        }
+
+        static PrefillResult seed(String seedBuffer) {
+            return new PrefillResult(seedBuffer, false, false);
+        }
+    }
 
     public static void main(String[] args) {
         printBanner();
@@ -30,112 +86,462 @@ public class Main {
 
         System.out.println("✅ API Key 已加载\n");
 
-        Scanner scanner = new Scanner(System.in);
+        // 初始化 JLine 终端：支持 raw mode 单键读取 + 括号粘贴
+        try (Terminal terminal = TerminalBuilder.builder().system(true).build()) {
+            LineReader lineReader = LineReaderBuilder.builder()
+                    .terminal(terminal)
+                    .build();
+            lineReader.option(LineReader.Option.BRACKETED_PASTE, true);
 
-        // 默认使用 ReAct，Plan 模式通过 /plan 进入
-        AgentMode mode = AgentMode.REACT;
-        Object agent = createAgent(apiKey, mode, false);
+            // 默认使用 ReAct 模式
+            Agent reactAgent = new Agent(apiKey);
+            System.out.println("🔄 使用 ReAct 模式\n");
+            // nextTaskUsePlanMode：/plan 命令设置此标记，下一条输入走 Plan 模式
+            boolean nextTaskUsePlanMode = false;
 
-        System.out.println("💡 提示:");
-        System.out.println("   - 输入你的问题或任务");
-        System.out.println("   - 输入 'mode' 切换执行模式");
-        System.out.println("   - 输入 '/plan' 进入 Plan-and-Execute 模式");
-        System.out.println("   - 输入 '/plan 任务内容' 直接用计划模式执行任务");
-        System.out.println("   - 默认模式是 ReAct");
-        System.out.println("   - 输入 'clear' 清空对话历史");
-        System.out.println("   - 输入 'exit' 或 'quit' 退出\n");
+            System.out.println("💡 提示:");
+            System.out.println("   - 输入你的问题或任务");
+            System.out.println("   - 输入 '/plan' 后，下一条任务使用 Plan-and-Execute 模式");
+            System.out.println("   - 输入 '/plan 任务内容' 直接用计划模式执行这条任务");
+            System.out.println("   - 计划生成后可直接执行、补充要求重规划，或取消");
+            System.out.println("   - 默认模式是 ReAct");
+            System.out.println("   - 输入 '/clear' 清空对话历史");
+            System.out.println("   - 输入 '/exit' 或 '/quit' 退出\n");
 
-        while (true) {
-            System.out.print("👤 你: ");
-            String input = scanner.nextLine().trim();
-
-            if (input.isEmpty()) {
-                continue;
-            }
-
-            CliCommandParser.ParsedCommand command = CliCommandParser.parse(input);
-            boolean revertToReactAfterRun = false;
-            switch (command.type()) {
-                case EXIT -> {
-                    System.out.println("\n👋 再见!");
-                    scanner.close();
-                    return;
+            while (true) {
+                PromptInput promptInput;
+                try {
+                    promptInput = readPromptInput(terminal, lineReader, nextTaskUsePlanMode);
+                } catch (UserInterruptException e) {
+                    continue;  // Ctrl+C 跳过
+                } catch (EndOfFileException e) {
+                    break;  // Ctrl+D 退出
                 }
-                case SELECT_MODE -> {
-                    mode = selectMode(scanner);
-                    agent = createAgent(apiKey, mode, true);
-                    continue;
-                }
-                case CLEAR -> {
-                    if (agent instanceof Agent) {
-                        ((Agent) agent).clearHistory();
+
+                if (promptInput.canceled()) {
+                    if (nextTaskUsePlanMode) {
+                        nextTaskUsePlanMode = false;
+                        System.out.println("↩️ 已取消待执行的 Plan-and-Execute，回到默认 ReAct。\n");
                     }
-                    System.out.println("🗑️ 对话历史已清空\n");
                     continue;
                 }
-                case SWITCH_PLAN -> {
-                    mode = AgentMode.PLAN_EXECUTE;
-                    agent = createAgent(apiKey, mode, true);
-                    if (command.payload() == null || command.payload().isEmpty()) {
+
+                String input = promptInput.text().trim();
+
+                if (input.isEmpty()) {
+                    continue;
+                }
+
+                CliCommandParser.ParsedCommand command = CliCommandParser.parse(input);
+                switch (command.type()) {
+                    case EXIT -> {
+                        System.out.println("\n👋 再见!");
+                        return;
+                    }
+                    case CLEAR -> {
+                        reactAgent.clearHistory();
+                        System.out.println("🗑️ 对话历史已清空\n");
                         continue;
                     }
-                    input = command.payload();
-                    revertToReactAfterRun = true;
+                    // /plan（无参数）：标记下一条输入走 Plan 模式，ESC 可取消
+                    case SWITCH_PLAN -> {
+                        if (command.payload() == null || command.payload().isEmpty()) {
+                            nextTaskUsePlanMode = true;
+                            System.out.println("📋 下一条任务将使用 Plan-and-Execute 模式，输入任务前按 ESC 可取消，执行完成后自动回到默认 ReAct。\n");
+                            continue;
+                        }
+                        // /plan 带 payload：直接走 Plan 模式执行该内容
+                        input = command.payload();
+                    }
+                    case NONE -> {
+                    }
                 }
-                case NONE -> {
+
+                // ── 模式路由：PlanExecuteAgent（带审查） vs Agent（ReAct） ──
+                System.out.println();
+                String response;
+                if (nextTaskUsePlanMode || command.type() == CliCommandParser.CommandType.SWITCH_PLAN) {
+                    PlanExecuteAgent planAgent = createPlanAgent(apiKey, terminal, lineReader);
+                    response = planAgent.run(input);
+                    nextTaskUsePlanMode = false;  // 执行完毕后回到 ReAct
+                } else {
+                    response = reactAgent.run(input);
                 }
+                System.out.println("🤖 Agent: " + response);
+                System.out.println();
             }
 
-            // 运行 Agent
-            System.out.println();
-            String response;
-            if (agent instanceof Agent) {
-                response = ((Agent) agent).run(input);
-            } else {
-                response = ((PlanExecuteAgent) agent).run(input);
-            }
-            System.out.println("🤖 Agent: " + response);
-            System.out.println();
-
-            if (revertToReactAfterRun && mode == AgentMode.PLAN_EXECUTE) {
-                mode = AgentMode.REACT;
-                agent = createAgent(apiKey, mode, true);
-            }
+        } catch (IOException e) {
+            System.err.println("❌ 终端初始化失败: " + e.getMessage());
+            System.exit(1);
         }
 
+        System.out.println("\n👋 再见!");
     }
 
     /**
-     * 选择执行模式
+     * 创建带交互式审查的 PlanExecuteAgent —— 注入 PlanReviewHandler，
+     * 让用户在计划生成后能预览、补充要求、取消或直接执行。
      */
-    private static AgentMode selectMode(Scanner scanner) {
-        System.out.println("请选择执行模式:");
-        System.out.println("  1. ReAct - 边思考边执行（适合简单任务）");
-        System.out.println("  2. Plan-and-Execute - 先规划后执行（适合复杂任务）");
-        System.out.print("> ");
-
-        String choice = scanner.nextLine().trim();
-        if (choice.equals("2")) {
-            return AgentMode.PLAN_EXECUTE;
-        }
-        return AgentMode.REACT;
+    private static PlanExecuteAgent createPlanAgent(String apiKey, Terminal terminal, LineReader lineReader) {
+        System.out.println("📋 使用 Plan-and-Execute 模式\n");
+        return new PlanExecuteAgent(apiKey, createPlanReviewHandler(terminal, lineReader));
     }
 
-    private static Object createAgent(String apiKey, AgentMode mode, boolean switched) {
-        if (mode == AgentMode.REACT) {
-            Agent agent = new Agent(apiKey);
-            System.out.println(switched ? "🔄 已切换到 ReAct 模式\n" : "🔄 使用 ReAct 模式\n");
-            return agent;
+    /**
+     * 读取一行用户输入，支持 ESC 取消和预填 buffer。
+     *
+     * <h3>allowEscCancel = false（ReAct 模式）</h3>
+     * 直接用 JLine readLine()，正常的行编辑体验。
+     *
+     * <h3>allowEscCancel = true（等待 Plan 模式输入时）</h3>
+     * 先进入 raw mode 读第一个字符判断意图：
+     * <ul>
+     *   <li>ESC → 取消 Plan 模式，回到 ReAct</li>
+     *   <li>Enter → 空输入</li>
+     *   <li>其他字符 → 作为 seed buffer 传给 JLine，支持粘贴多行文本</li>
+     * </ul>
+     */
+    private static PromptInput readPromptInput(Terminal terminal, LineReader lineReader, boolean allowEscCancel)
+            throws UserInterruptException, EndOfFileException {
+        if (!allowEscCancel) {
+            return PromptInput.submitted(lineReader.readLine("👤 你: "));
         }
 
-        PlanExecuteAgent agent = new PlanExecuteAgent(apiKey);
-        System.out.println(switched ? "📋 已切换到 Plan-and-Execute 模式\n" : "📋 使用 Plan-and-Execute 模式\n");
-        return agent;
+        String prompt = "👤 你: ";
+        System.out.print(prompt);
+        System.out.flush();
+
+        PrefillResult prefill = readPrefillInputFromTerminal(terminal);
+        if (prefill == null) {
+            return PromptInput.submitted(lineReader.readLine(""));
+        }
+
+        if (prefill.canceled()) {
+            System.out.println();
+            return PromptInput.canceledInput();
+        }
+
+        if (prefill.submitted()) {
+            System.out.println();
+            return PromptInput.submitted("");
+        }
+
+        // 用户已开始输入 → 将预读到的字符作为 JLine 的 seed buffer
+        return PromptInput.submitted(lineReader.readLine("", null, (MaskingCallback) null, prefill.seedBuffer()));
     }
 
-    private enum AgentMode {
-        REACT,
-        PLAN_EXECUTE
+    /**
+     * 创建计划审查的交互式 handler —— 注入到 PlanExecuteAgent 中。
+     *
+     * <h3>交互设计</h3>
+     * 计划生成后阻塞等待用户决策，四种操作：
+     * <ul>
+     *   <li>Enter → 直接执行当前计划</li>
+     *   <li>Ctrl+O → 展开完整计划视图（visualize）</li>
+     *   <li>I → 输入补充要求，解析后可能 SUPPLEMENT 或 CANCEL</li>
+     *   <li>ESC → 双重语义：已展开时折叠回摘要；未展开时取消本次计划</li>
+     * </ul>
+     *
+     * <h3>ESC 双重语义的实现</h3>
+     * 用 {@code expanded} 布尔值区分：expanded=true 时 ESC 只是折叠，
+     * expanded=false 时 ESC 才真正取消。这样用户可以先展开查看详情再决定。
+     *
+     * <h3>兜底：行输入模式</h3>
+     * 如果 readSingleKeyFromTerminal 返回 null（无法进入 raw mode），
+     * 回退到 JLine readLine 行输入，支持 /view、空输入（执行）、/cancel 等命令。
+     */
+    private static PlanExecuteAgent.PlanReviewHandler createPlanReviewHandler(Terminal terminal, LineReader lineReader) {
+        return (String goal, ExecutionPlan plan) -> {
+            boolean expanded = false;
+            System.out.println(plan.summarize());
+            System.out.println("📝 计划已生成。");
+            System.out.println("   - 回车：按当前计划执行");
+            System.out.println("   - Ctrl+O：展开完整计划");
+            System.out.println("   - ESC：折叠或取消本次计划");
+            System.out.println("   - I：输入补充要求后重新规划\n");
+
+            while (true) {
+                Integer key = readSingleKeyFromTerminal(terminal);
+                if (key != null) {
+                    // Enter (13 或 10)
+                    if (key == '\n' || key == '\r') {
+                        System.out.println();
+                        return PlanExecuteAgent.PlanReviewDecision.execute();
+                    }
+
+                    // ESC (27)
+                    if (key == 27) {
+                        System.out.println();
+                        if (expanded) {
+                            expanded = false;
+                            System.out.println(plan.summarize());
+                            System.out.println("📁 已退出完整计划视图，继续按 Enter / Ctrl+O / ESC / I。\n");
+                            continue;
+                        }
+                        return PlanExecuteAgent.PlanReviewDecision.cancel();
+                    }
+
+                    // I 或 i
+                    if (key == 'i' || key == 'I') {
+                        System.out.println();
+                        String supplementInput = lineReader.readLine("补充> ").trim();
+                        PlanReviewInputParser.Decision supplementDecision =
+                                PlanReviewInputParser.parse(supplementInput);
+                        return mapReviewDecision(supplementDecision);
+                    }
+
+                    // Ctrl+O
+                    if (key == CTRL_O) {
+                        System.out.println();
+                        System.out.println(plan.visualize());
+                        expanded = true;
+                        System.out.println("👆 已展开完整计划，继续按 Enter / Ctrl+O / ESC / I。\n");
+                        continue;
+                    }
+
+                    System.out.println();
+                    System.out.println("未识别按键，请按 Enter / Ctrl+O / ESC / I。\n");
+                    continue;
+                }
+
+                // 如果无法读取单键，回退到行输入模式
+                String decisionInput = lineReader.readLine("操作/补充> ").trim();
+                if (decisionInput.equalsIgnoreCase("/view")) {
+                    System.out.println();
+                    System.out.println(plan.visualize());
+                    expanded = true;
+                    System.out.println("👆 已展开完整计划，继续输入 Enter / /cancel / 补充要求。\n");
+                    continue;
+                }
+                PlanReviewInputParser.Decision decision = PlanReviewInputParser.parse(decisionInput);
+                return mapReviewDecision(decision);
+            }
+        };
+    }
+
+    /**
+     * 进入 raw mode 读取单个按键，读取后恢复终端属性。
+     *
+     * <h3>为什么读完后 drain ESC 序列？</h3>
+     * 终端的方向键、功能键以 ESC (27) 开头后跟 [A/[B/[C/[D 等字节序列。
+     * 如果用户误按方向键，只读到 ESC 而后续字节残留在输入缓冲区，
+     * 下次 read 会读到脏数据。drain 确保缓冲区干净。
+     *
+     * @return 按键的 ASCII/Unicode 码点，读取失败返回 null
+     */
+    private static Integer readSingleKeyFromTerminal(Terminal terminal) {
+        try {
+            terminal.flush();
+            Attributes originalAttributes = terminal.enterRawMode();
+            try {
+                int key = terminal.reader().read();
+                if (key < 0) {
+                    return null;
+                }
+
+                // 如果是 ESC，需要 drain 掉后续的方向键序列字节
+                if (key == 27) {
+                    drainEscapeSequence(terminal);
+                }
+
+                return key;
+            } finally {
+                terminal.setAttributes(originalAttributes);
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 在 raw mode 下读取第一个字符，判断用户意图。
+     *
+     * <h3>三种分支</h3>
+     * <ul>
+     *   <li>ESC (27) → 进一步读后续字节，判断是取消还是括号粘贴</li>
+     *   <li>Enter → 空提交（用户直接回车）</li>
+     *   <li>其他字符 → 用户开始输入，继续 burst read 剩余字节后作为 seed buffer</li>
+     * </ul>
+     *
+     * <h3>退格键处理</h3>
+     * 退格 (8/127) 被视为空字符串，因为 seed buffer 中不应该包含退格字符——
+     * 用户按退格意味着清空了预填内容。
+     */
+    private static PrefillResult readPrefillInputFromTerminal(Terminal terminal) {
+        try {
+            terminal.flush();
+            Attributes originalAttributes = terminal.enterRawMode();
+            try {
+                int key = terminal.reader().read();
+                if (key < 0) {
+                    return null;
+                }
+
+                if (key == 27) {
+                    return readEscapeInput(terminal);
+                }
+
+                if (isSubmitKey(key)) {
+                    return PrefillResult.submittedInput();
+                }
+
+                String rawInput = switch (key) {
+                    case 8, 127 -> "";
+                    default -> Character.toString((char) key);
+                };
+
+                rawInput += readInputBurst(terminal, 20, 25, 250);
+                return PrefillResult.seed(prepareSeedBuffer(rawInput));
+            } finally {
+                terminal.setAttributes(originalAttributes);
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 处理 ESC 之后的输入：区分"纯取消"和"括号粘贴"。
+     *
+     * <h3>括号粘贴检测</h3>
+     * 现代终端在粘贴多行文本时会在内容前后包裹 {@code \e[200~} ... {@code \e[201~}。
+     * 粘贴操作以 ESC 开头，所以先读到 ESC 后需要检查后续字节是否匹配粘贴前缀。
+     * 如果匹配 → 循环读取直到遇到粘贴后缀 → 提取中间文本作为 seed buffer。
+     * 如果不匹配 → 纯 ESC → 用户取消。
+     */
+    private static PrefillResult readEscapeInput(Terminal terminal) throws IOException, InterruptedException {
+        String sequence = readInputBurst(terminal, 30, 25, 250);
+        if (sequence.isEmpty()) {
+            return PrefillResult.canceledInput();
+        }
+
+        if (sequence.startsWith(BRACKETED_PASTE_BEGIN)) {
+            String pastedText = sequence.substring(BRACKETED_PASTE_BEGIN.length());
+            while (!pastedText.contains(BRACKETED_PASTE_END)) {
+                String burst = readInputBurst(terminal, 30, 25, 500);
+                if (burst.isEmpty()) {
+                    break;
+                }
+                pastedText += burst;
+            }
+
+            return PrefillResult.seed(prepareSeedBuffer(stripBracketedPasteEndMarker(pastedText)));
+        }
+
+        return PrefillResult.canceledInput();
+    }
+
+    /**
+     * 在 raw mode 下批量读取连续到达的字节，用于捕获粘贴或快速输入。
+     *
+     * <h3>三阶段超时策略</h3>
+     * <ul>
+     *   <li>firstWaitMs：首个字节到达前的等待窗口。buffer 为空时用这个超时，
+     *       确保有足够时间等待粘贴的第一个字节到达</li>
+     *   <li>idleWaitMs：字节间的空闲超时。每读到一个字节就重置 idleDeadline，
+     *       连续有数据到达就一直读，间隔超过 idleWaitMs 则认为输入结束</li>
+     *   <li>maxWaitMs：整体最大等待时间，防止无限阻塞</li>
+     * </ul>
+     *
+     * <h3>为什么不用 read() 阻塞等？</h3>
+     * 终端输入没有 EOF 标记，无法知道"用户打完了没"。
+     * 用轮询 + 空闲超时是实时终端处理粘贴的标准做法。
+     */
+    private static String readInputBurst(Terminal terminal, long firstWaitMs, long idleWaitMs, long maxWaitMs)
+            throws IOException, InterruptedException {
+        StringBuilder buffer = new StringBuilder();
+        long start = System.currentTimeMillis();
+        long firstDeadline = start + firstWaitMs;
+        long idleDeadline = 0;
+
+        while (System.currentTimeMillis() - start < maxWaitMs) {
+            if (terminal.reader().ready()) {
+                int next = terminal.reader().read();
+                if (next < 0) {
+                    break;
+                }
+                buffer.append((char) next);
+                idleDeadline = System.currentTimeMillis() + idleWaitMs;
+                continue;
+            }
+
+            long now = System.currentTimeMillis();
+            if (buffer.isEmpty()) {
+                if (now >= firstDeadline) {
+                    break;
+                }
+            } else if (now >= idleDeadline) {
+                break;
+            }
+
+            Thread.sleep(5);
+        }
+
+        return buffer.toString();
+    }
+
+    /**
+     * 将 raw mode 读取的原始文本规范化，准备作为 JLine seed buffer。
+     * 主要处理 \r\n → \n 的转换，因为终端粘贴可能混入不同的换行符。
+     */
+    static String prepareSeedBuffer(String rawInput) {
+        if (rawInput == null || rawInput.isEmpty()) {
+            return "";
+        }
+        return normalizeLineEndings(rawInput);
+    }
+
+    /** 统一换行符：\r\n 和单独的 \r 都转为 \n，保证跨平台一致性。 */
+    static String normalizeLineEndings(String rawInput) {
+        return rawInput
+                .replace("\r\n", "\n")
+                .replace('\r', '\n');
+    }
+
+    /** 去除括号粘贴的后缀标记 {@code \e[201~}，只保留用户实际粘贴的文本。 */
+    private static String stripBracketedPasteEndMarker(String rawInput) {
+        int endMarkerIndex = rawInput.indexOf(BRACKETED_PASTE_END);
+        if (endMarkerIndex >= 0) {
+            return rawInput.substring(0, endMarkerIndex);
+        }
+        return rawInput;
+    }
+
+    /** 判断按键是否为回车（\n / \r），兼容不同终端的回车表示。 */
+    private static boolean isSubmitKey(int key) {
+        return key == '\n' || key == '\r';
+    }
+
+    /**
+     * 在读到 ESC 后清空终端缓冲区中的残留字节。
+     *
+     * 方向键（上/下/左/右）和功能键（F1-F12）都以 ESC 开头后跟多字节序列。
+     * 用户可能误按方向键，此时只读到了 ESC，后续的 [A/[B 等字节还残留在缓冲区。
+     * 短暂 sleep 50ms 等后续字节全部到达后全部 drain 掉，防止污染下一次读取。
+     */
+    private static void drainEscapeSequence(Terminal terminal) {
+        try {
+            // 短暂等待，让后续字节到达
+            Thread.sleep(50);
+            // 检查并丢弃所有待读字节（如方向键序列 [A, [B 等）
+            while (terminal.reader().ready()) {
+                terminal.reader().read();
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * 将 PlanReviewInputParser 的解析结果映射为 PlanExecuteAgent 的审查决策类型。
+     * 两个类型语义一一对应：EXECUTE/SUPPLEMENT/CANCEL。
+     */
+    private static PlanExecuteAgent.PlanReviewDecision mapReviewDecision(PlanReviewInputParser.Decision decision) {
+        return switch (decision.type()) {
+            case EXECUTE -> PlanExecuteAgent.PlanReviewDecision.execute();
+            case CANCEL -> PlanExecuteAgent.PlanReviewDecision.cancel();
+            case SUPPLEMENT -> PlanExecuteAgent.PlanReviewDecision.supplement(decision.feedback());
+        };
     }
 
     /**

@@ -6,46 +6,94 @@ import com.paicli.tool.ToolRegistry;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.stream.Collectors;
 
 /**
- * Plan-and-Execute Agent —— 先规划后执行。
+ * Plan-and-Execute Agent —— 先规划，用户审查，再批量并行执行。
  *
- * <h3>与 {@link Agent}（纯 ReAct）的分工</h3>
- * {@link #shouldPlan(String)} 用启发式规则判断输入复杂度：
- * <ul>
- *   <li>简单任务（动作关键词 &lt; 3 且输入 ≤ 50 字）→ {@link #runSimple(String)} 直接调 LLM + 工具</li>
- *   <li>复杂任务 → {@link #runWithPlan(String)} 走完整 Plan-Execute 流水线</li>
- * </ul>
- *
- * <h3>Plan-Execute 流水线</h3>
+ * <h3>核心流水线</h3>
  * <pre>
- * Planner.createPlan(goal)                    ← LLM 生成任务 DAG JSON
- *   └─ parsePlan() → ExecutionPlan
- *        └─ computeExecutionOrder() → 拓扑序 + 环检测
- *
- * plan.visualize()                            ← 打印计划让用户预览
- *
- * executePlan(goal, plan):
- *   for taskId in executionOrder:             ← 按拓扑序遍历
- *     ├─ task.isExecutable()?                 ← 运行时二次校验
- *     ├─ executeTask(goal, plan, task)        ← 每个 Task 独立调 LLM
- *     ├─ markCompleted / markFailed
- *     └─ progress < 50%? → replan            ← 失败触发重规划
+ * run(userInput)
+ *   └─ runWithPlan(goal)
+ *        ├─ Planner.createPlan(goal)              ← LLM 生成任务 DAG JSON
+ *        ├─ reviewAndExecutePlan(plan)            ← 用户审查（执行/补充/取消）
+ *        │    └─ PlanReviewHandler.review()       ← 依赖注入的审查回调
+ *        └─ executePlan(plan)                     ← 批次并行执行
+ *             ├─ while 仍有可执行任务:
+ *             │    ├─ getExecutableTasksInOrder()  ← 拓扑序 + isExecutable 过滤
+ *             │    └─ executeTaskBatch()           ← 单任务直接跑 / 多任务线程池并行
+ *             └─ buildFinalResult()                ← 收集叶子节点结果
  * </pre>
+ *
+ * <h3>模式路由</h3>
+ * 当前由 CLI 层（Main.java）通过 /plan 命令控制是否使用本 Agent，
+ * Agent 内部不再自动判断 ReAct vs Plan。
  *
  * <h3>双层安全网</h3>
  * <ol>
  *   <li><b>拓扑排序</b>（静态）：建图时一次性确定安全执行顺序，检测环</li>
- *   <li><b>isExecutable()</b>（动态）：执行前校验所有前置依赖确实 COMPLETED，
- *       防止因前置任务 FAILED 而执行不该执行的后继任务</li>
+ *   <li><b>isExecutable()</b>（动态）：每轮 while 循环重新过滤，防止前置 FAILED 导致后继错误执行</li>
  * </ol>
  */
 public class PlanExecuteAgent {
+    /**
+     * 单个任务的执行结果封装 —— 成功时 result 有值，失败时 error 有值。
+     * 用于统一处理单任务和并行任务两种路径的返回值。
+     */
+    private record TaskExecutionResult(Task task, String result, Exception error) {
+        static TaskExecutionResult success(Task task, String result) {
+            return new TaskExecutionResult(task, result, null);
+        }
+
+        static TaskExecutionResult failure(Task task, Exception error) {
+            return new TaskExecutionResult(task, null, error);
+        }
+
+        boolean failed() {
+            return error != null;
+        }
+    }
+
+    /**
+     * 计划审查回调接口 —— 依赖反转：Agent 只定义接口，CLI 层实现终端的交互细节。
+     * 默认实现：不弹审查，直接执行。
+     */
+    public interface PlanReviewHandler {
+        PlanReviewDecision review(String goal, ExecutionPlan plan);
+    }
+
+    /** 用户对计划的三种决策 */
+    public enum PlanReviewAction {
+        EXECUTE,      // 执行当前计划
+        SUPPLEMENT,   // 补充要求，重新规划
+        CANCEL        // 取消本次计划
+    }
+
+    /** 审查决策 + 补充说明（SUPPLEMENT 时 feedback 非空） */
+    public record PlanReviewDecision(PlanReviewAction action, String feedback) {
+        public static PlanReviewDecision execute() {
+            return new PlanReviewDecision(PlanReviewAction.EXECUTE, null);
+        }
+
+        public static PlanReviewDecision supplement(String feedback) {
+            return new PlanReviewDecision(PlanReviewAction.SUPPLEMENT, feedback);
+        }
+
+        public static PlanReviewDecision cancel() {
+            return new PlanReviewDecision(PlanReviewAction.CANCEL, null);
+        }
+    }
+
     private final GLMClient llmClient;
     private final ToolRegistry toolRegistry;
     private final Planner planner;
+    /** 审查回调 —— 由 CLI 层注入，控制是否弹交互式审查界面 */
+    private final PlanReviewHandler reviewHandler;
 
-    // 执行提示词
     private static final String EXECUTION_PROMPT = """
             你是一个任务执行专家。请根据当前任务和上下文，选择合适的工具或生成回复。
 
@@ -63,41 +111,38 @@ public class PlanExecuteAgent {
             请用中文回复。
             """;
 
+    /**
+     * 无审查构造器：生成计划后直接执行，不弹交互界面。
+     */
     public PlanExecuteAgent(String apiKey) {
-        this.llmClient = new GLMClient(apiKey);
-        this.toolRegistry = new ToolRegistry();
-        this.planner = new Planner(llmClient);
+        this(apiKey, (goal, plan) -> PlanReviewDecision.execute());
     }
 
     /**
-     * 运行任务（自动判断是否需要规划）
+     * 带审查构造器：通过 {@link PlanReviewHandler} 注入交互逻辑。
+     * handler 为 null 时回退为直接执行。
+     */
+    public PlanExecuteAgent(String apiKey, PlanReviewHandler reviewHandler) {
+        this.llmClient = new GLMClient(apiKey);
+        this.toolRegistry = new ToolRegistry();
+        this.planner = new Planner(llmClient);
+        this.reviewHandler = reviewHandler == null ? (goal, plan) -> PlanReviewDecision.execute() : reviewHandler;
+    }
+
+    /**
+     * 运行入口：所有输入统一走 Plan 路径（模式选择由 CLI 层负责）。
      */
     public String run(String userInput) {
         try {
-            // 判断是否需要复杂规划
-            if (shouldPlan(userInput)) {
-                return runWithPlan(userInput);
-            } else {
-                // 简单任务直接用ReAct
-                return runSimple(userInput);
-            }
+            return runWithPlan(userInput);
         } catch (Exception e) {
             return "❌ 执行失败: " + e.getMessage();
         }
     }
 
     /**
-     * 启发式判断输入是否需要走 Plan-and-Execute 模式。
-     *
-     * <h3>判断依据</h3>
-     * 统计输入中的中文动作关键词出现次数：
-     * <ul>
-     *   <li>≥ 3 个动作关键词 → 复杂任务，需要规划</li>
-     *   <li>输入 > 50 字 → 说明任务描述长，大概率涉及多步操作</li>
-     *   <li>否则 → 简单任务，直接用 ReAct 模式</li>
-     * </ul>
-     * 这个启发式不完美，但足够覆盖第 2 期的常见用例。
-     * 后续可以考虑让 LLM 自己判断（增加一次轻量分类调用）。
+     * 启发式判断输入复杂度 —— 当前保留但不再被 run() 调用。
+     * CLI 层通过 /plan 命令显式切换模式，不依赖自动判断。
      */
     private boolean shouldPlan(String input) {
         String lower = input.toLowerCase();
@@ -112,79 +157,118 @@ public class PlanExecuteAgent {
     }
 
     /**
-     * Plan 模式入口：规划 → 可视化 → 执行。
-     * 将 {@code Planner}、{@code ExecutionPlan}、{@code executePlan()} 串联起来。
+     * Plan 模式入口：LLM 规划 → 用户审查 → 批次执行。
      */
     private String runWithPlan(String goal) throws IOException {
-        // 1. 创建执行计划
         ExecutionPlan plan = planner.createPlan(goal);
-        return executePlan(goal, plan);
+        return reviewAndExecutePlan(plan);
     }
 
     /**
-     * 按拓扑序遍历执行计划中的所有 Task。
+     * 计划审查循环 —— 阻塞等待用户决策后才进入执行。
      *
-     * <h3>运行时校验（双层安全网的第二层）</h3>
-     * 遍历 {@code executionOrder} 时，每个 Task 执行前再调一次 {@link Task#isExecutable(Map)}。
-     * 虽然拓扑序在静态上保证了顺序安全，但运行时可能发生：
+     * <h3>三种决策路径</h3>
      * <ul>
-     *   <li>前置任务 FAILED（而非 COMPLETED）→ 后继不应执行 → 跳过</li>
-     *   <li>前置任务被 SKIPPED → 同理跳过</li>
+     *   <li>EXECUTE → 直接进入 {@link #executePlan(ExecutionPlan)}</li>
+     *   <li>CANCEL → 返回取消消息，不执行任何任务</li>
+     *   <li>SUPPLEMENT → 将补充要求拼接到原 goal 上，
+     *       调用 {@code planner.createPlan()} 重新生成计划，
+     *       然后再次进入审查循环</li>
      * </ul>
      *
-     * <h3>重规划阈值 — 50%</h3>
-     * 任务失败时，如果整体进度不到一半（{@code progress < 0.5}），
-     * 说明大部分工作还没做，重新规划是划算的。
-     * 进度过半后继续执行剩余任务（失败的任务跳过），避免重来浪费已完成的工作。
-     *
-     * <h3>递归 replan</h3>
-     * replan 成功后通过<strong>递归调用</strong>执行新计划：
-     * {@code return executePlan(goal, replanned)}。
-     * 这意味着原计划的执行被新计划完全替代，不会回到旧计划继续执行。
+     * <h3>为什么是 while(true)？</h3>
+     * 用户可能多次补充要求，每次都会重新规划并再次审查，
+     * 直到用户满意（选 EXECUTE）或放弃（选 CANCEL）才跳出。
      */
-    private String executePlan(String goal, ExecutionPlan plan) throws IOException {
-        // 显示计划
-        System.out.println(plan.visualize());
+    private String reviewAndExecutePlan(ExecutionPlan plan) throws IOException {
+        while (true) {
+            PlanReviewDecision decision = reviewHandler.review(plan.getGoal(), plan);
+            if (decision == null || decision.action() == PlanReviewAction.EXECUTE) {
+                return executePlan(plan);
+            }
+
+            if (decision.action() == PlanReviewAction.CANCEL) {
+                return "❌ 已取消本次计划执行。";
+            }
+
+            String feedback = decision.feedback() == null ? "" : decision.feedback().trim();
+            if (feedback.isEmpty()) {
+                return executePlan(plan);
+            }
+
+            System.out.println("📒 已收补充要求，正在重新规划...");
+            plan = planner.createPlan(plan.getGoal() + "\n补充要求: " + feedback);
+        }
+    }
+
+    /**
+     * 按拓扑序 + 批次并行 DAG 中的所有 Task。
+     *
+     * <h3>while 循环 vs 旧版 for 循环</h3>
+     * 旧版是 {@code for taskId in executionOrder} 逐个执行。
+     * 新版改为 while + 每轮重新计算"当前可执行任务"：
+     * <ul>
+     *   <li>一轮可能同时完成多个互不依赖的任务</li>
+     *   <li>下一轮才有新的任务变得可执行（其前置依赖刚完成）</li>
+     *   <li>while 保证不会漏掉后续批次</li>
+     * </ul>
+     *
+     * <h3>并行安全前提</h3>
+     * 同一批次中的任务都通过了 {@link Task#isExecutable(Map)} 校验，
+     * 即所有前置依赖都已完成，因此并行执行互不干扰。
+     *
+     * <h3>僵局检测</h3>
+     * while 退出但计划未全部完成且没有失败 → 存在永远无法满足的依赖
+     * （如依赖了不存在的任务）→ 标记 FAILED 并返回提示。
+     *
+     * <h3>重规划</h3>
+     * 任务失败 + 进度 &lt; 50% → replan 并重新进入审查循环，
+     * 而非直接递归 executePlan（让用户在 replan 后有机会审查新计划）。
+     */
+    private String executePlan(ExecutionPlan plan) throws IOException {
         System.out.println("🚀 开始执行计划...\n");
 
-        // 2. 执行计划
         plan.markStarted();
         StringBuilder finalResult = new StringBuilder();
 
-        List<String> executionOrder = plan.getExecutionOrder();
-        for (String taskId : executionOrder) {
-            Task task = plan.getTask(taskId);
-
-            // 检查依赖
-            if (!task.isExecutable(plan.getAllTasks().stream()
-                    .collect(java.util.stream.Collectors.toMap(Task::getId, t -> t)))) {
-                System.out.println("⏭️ 跳过任务（依赖未完成）: " + taskId);
-                task.markSkipped();
-                continue;
+        // 每次都从无依赖或者前置依赖已经完成的节点开始执行任务。
+        while (true) {
+            List<Task> executableTasks = getExecutableTasksInOrder(plan);
+            if (executableTasks.isEmpty()) {
+                break;
             }
 
-            // 执行任务
-            System.out.println("▶️ 执行任务: " + task.getDescription());
-            task.markStarted();
+            List<TaskExecutionResult> batchResults = executeTaskBatch(plan, executableTasks);
+            for (TaskExecutionResult batchResult : batchResults) {
+                Task task = batchResult.task();
 
-            try {
-                String result = executeTask(goal, plan, task);
-                task.markCompleted(result);
-                System.out.println("✅ 完成: " + result.substring(0, Math.min(100, result.length())) + "\n");
+                if (!batchResult.failed()) {
+                    task.markCompleted(batchResult.result());
+                    System.out.println("✅ 完成 [" + task.getId() + "]: "
+                            + batchResult.result().substring(0, Math.min(100, batchResult.result().length())) + "\n");
+                    continue;
+                }
 
-            } catch (Exception e) {
-                task.markFailed(e.getMessage());
-                System.out.println("❌ 失败: " + e.getMessage() + "\n");
+                Exception error = batchResult.error();
+                task.markFailed(error.getMessage());
+                System.out.println("❌ 失败 [" + task.getId() + "]: " + error.getMessage() + "\n");
 
-                // 尝试重新规划
                 if (plan.getProgress() < 0.5) {
                     System.out.println("🔄 尝试重新规划...\n");
-                    ExecutionPlan replanned = planner.replan(plan, e.getMessage());
-                    return executePlan(goal, replanned);
-                } else {
-                    finalResult.append("任务 ").append(taskId).append(" 失败: ").append(e.getMessage());
+                    ExecutionPlan replanned = planner.replan(plan, error.getMessage());
+                    return reviewAndExecutePlan(replanned);
                 }
+
+                if (!finalResult.isEmpty()) {
+                    finalResult.append("\n");
+                }
+                finalResult.append("任务 ").append(task.getId()).append(" 失败: ").append(error.getMessage());
             }
+        }
+
+        if (!plan.isAllCompleted() && !plan.hasFailed()) {
+            plan.markFailed();
+            return "⚠️ 计划未能继续推进，存在未满足依赖的任务。";
         }
 
         if (finalResult.isEmpty()) {
@@ -202,6 +286,95 @@ public class PlanExecuteAgent {
     }
 
     /**
+     * 获取当前可执行的任务，按拓扑序排列。
+     *
+     * <h3>为什么不直接用 getExecutableTasks()？</h3>
+     * {@link ExecutionPlan#getExecutableTasks()} 返回所有 isExecutable==true 的任务，
+     * 但不保证顺序。本方法先取可执行集合，再按拓扑序过滤，
+     * 确保同一批次内的任务也保持依赖顺序。
+     */
+    private List<Task> getExecutableTasksInOrder(ExecutionPlan plan) {
+        Set<String> executableIds = plan.getExecutableTasks().stream()
+                .map(Task::getId)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        return plan.getExecutionOrder().stream()
+                .filter(executableIds::contains)
+                .map(plan::getTask)
+                .toList();
+    }
+
+    /**
+     * 批量执行一组互不依赖的任务。
+     *
+     * <h3>单任务 vs 并行</h3>
+     * 只有一个任务时直接在当前线程执行，避免线程池创建开销。
+     * 多个任务时用 {@link ExecutorService} 并行执行——
+     * 前提是这些任务都通过了 isExecutable 校验，互不依赖。
+     *
+     * <h3>错误处理</h3>
+     * {@link InterruptedException}：恢复中断标记，当前线程应响应取消
+     * {@link ExecutionException}：解包原始异常，保留失败原因
+     * finally 中 shutdownNow() 确保线程池立即释放
+     */
+    private List<TaskExecutionResult> executeTaskBatch(ExecutionPlan plan, List<Task> executableTasks) {
+        if (executableTasks.size() == 1) {
+            Task task = executableTasks.get(0);
+            System.out.println("▶️ 执行任务 [" + task.getId() + "]: " + task.getDescription());
+            task.markStarted();
+
+            try {
+                return List.of(TaskExecutionResult.success(task, executeTask(plan.getGoal(), plan, task)));
+            } catch (Exception e) {
+                return List.of(TaskExecutionResult.failure(task, e));
+            }
+        }
+
+        String parallelTaskIds = executableTasks.stream()
+                .map(Task::getId)
+                .collect(Collectors.joining(", "));
+        System.out.println("⚡ 本轮并行执行 " + executableTasks.size() + " 个任务: " + parallelTaskIds);
+
+        ExecutorService executor = Executors.newFixedThreadPool(Math.min(executableTasks.size(), 4));
+        try {
+            List<Future<TaskExecutionResult>> futures = new ArrayList<>();
+            for (Task task : executableTasks) {
+                System.out.println("▶️ 并行任务 [" + task.getId() + "]: " + task.getDescription());
+                task.markStarted();
+                futures.add(executor.submit(() -> {
+                    try {
+                        return TaskExecutionResult.success(task, executeTask(plan.getGoal(), plan, task));
+                    } catch (Exception e) {
+                        return TaskExecutionResult.failure(task, e);
+                    }
+                }));
+            }
+
+            List<TaskExecutionResult> results = new ArrayList<>();
+            for (Future<TaskExecutionResult> future : futures) {
+                try {
+                    results.add(future.get());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    results.add(TaskExecutionResult.failure(executableTasks.get(results.size()), e));
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    Exception error = cause instanceof Exception exception
+                            ? exception
+                            : new RuntimeException(cause);
+                    results.add(TaskExecutionResult.failure(executableTasks.get(results.size()), error));
+                }
+            }
+            return results;
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    // 最大任务迭代次数
+    private static final int MAX_TASK_ITERATIONS = 5;
+
+    /**
      * 执行单个 Task：组装 prompt → 调 LLM → 执行工具调用。
      *
      * <h3>每个 Task 有独立的 LLM 调用</h3>
@@ -209,25 +382,39 @@ public class PlanExecuteAgent {
      * System prompt + User context（含依赖结果）→ LLM 回复/工具调用 → 直接返回。
      * 不维护跨 Task 的对话历史——依赖结果通过 {@link #buildTaskContext} 传递。
      */
+    /**
+     * 执行单个任务（支持多轮工具调用）
+     */
     private String executeTask(String goal, ExecutionPlan plan, Task task) throws IOException {
-        // 构建执行提示
         String prompt = String.format(EXECUTION_PROMPT,
                 task.getType(), task.getDescription());
 
-        List<GLMClient.Message> messages = Arrays.asList(
+        List<GLMClient.Message> messages = new ArrayList<>(Arrays.asList(
                 GLMClient.Message.system(prompt),
                 GLMClient.Message.user(buildTaskContext(goal, plan, task))
-        );
+        ));
 
-        // 调用LLM
-        GLMClient.ChatResponse response = llmClient.chat(
-                messages,
-                toolRegistry.getToolDefinitions()
-        );
+        StringBuilder allResults = new StringBuilder();
+        int iteration = 0;
 
-        // 如果有工具调用，执行工具
-        if (response.hasToolCalls()) {
-            StringBuilder results = new StringBuilder();
+        while (iteration < MAX_TASK_ITERATIONS) {
+            iteration++;
+
+            GLMClient.ChatResponse response = llmClient.chat(
+                    messages,
+                    toolRegistry.getToolDefinitions()
+            );
+
+            if (!response.hasToolCalls()) {
+                // 没有工具调用，返回最终结果
+                if (!allResults.isEmpty() && (response.content() == null || response.content().isBlank())) {
+                    return allResults.toString().trim();
+                }
+                return response.content();
+            }
+
+            // 有工具调用：执行工具并将结果回灌到消息历史
+            messages.add(GLMClient.Message.assistant(response.content(), response.toolCalls()));
 
             for (GLMClient.ToolCall toolCall : response.toolCalls()) {
                 String toolName = toolCall.function().name();
@@ -236,14 +423,12 @@ public class PlanExecuteAgent {
                 System.out.println("   🔧 调用工具: " + toolName);
 
                 String toolResult = toolRegistry.executeTool(toolName, toolArgs);
-                results.append(toolResult).append("\n");
+                allResults.append(toolResult).append("\n");
+                messages.add(GLMClient.Message.tool(toolCall.id(), toolResult));
             }
-
-            return results.toString().trim();
-        } else {
-            // 直接返回分析结果
-            return response.content();
         }
+
+        return allResults.toString().trim();
     }
 
     /**

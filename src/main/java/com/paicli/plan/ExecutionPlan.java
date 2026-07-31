@@ -130,8 +130,10 @@ public class ExecutionPlan {
      *
      * <h3>为什么用后序加入 executionOrder？</h3>
      * 后序遍历（递归返回后才 add）保证每个节点的所有前置依赖先于它加入列表。
-     * 例如 A → B → C 的链：DFS 先深入 C（无依赖），C 先加入，回溯到 B 加入，
-     * 再回溯到 A 加入，最终顺序 [C, B, A]。执行时从左到右就是安全的。
+     * 例如 task_1（无依赖）← task_2（依赖 task_1）← task_3（依赖 task_2）：
+     * DFS 沿 dependencies 边向根方向深入，先到底层的 task_1（无依赖），
+     * task_1 先加入，回溯到 task_2 加入，再回溯到 task_3 加入，
+     * 最终顺序 [task_1, task_2, task_3]。从左到右遍历执行就是安全的。
      *
      * <h3>为什么不在构造时自动调这个方法？</h3>
      * Planner.parsePlan() 分两遍解析 JSON：第一遍建节点（可能前向引用），
@@ -298,6 +300,89 @@ public class ExecutionPlan {
         return sb.toString();
     }
 
+    /**
+     * 默认折叠展示，避免完整 DAG(有向无环图) 占满终端。
+     */
+    public String summarize() {
+        List<List<Task>> batches = getExecutionBatches();
+        List<Task> readyTasks = getExecutableTasks();
+        StringBuilder sb = new StringBuilder();
+        sb.append("📋 计划摘要\n");
+        sb.append("   - 目标: ").append(compactGoal(goal, 48)).append('\n');
+        sb.append("   - 任务数: ").append(tasks.size())
+                .append(" | 并行批次: ").append(batches.size())
+                .append(" | 当前可执行: ").append(readyTasks.size())
+                .append(" | 状态: ").append(status).append('\n');
+
+        if (!batches.isEmpty()) {
+            sb.append("   - 首批执行: ").append(formatTaskList(batches.get(0), 5)).append('\n');
+            if (batches.size() > 1) {
+                sb.append("   - 最终收敛: ")
+                        .append(formatTaskList(batches.get(batches.size() - 1), 5))
+                        .append('\n');
+            }
+        }
+
+        return sb.toString();
+    }
+
+    public List<List<Task>> getExecutionBatches() {
+        if (tasks.isEmpty()) {
+            return List.of();
+        }
+
+        Map<String, Task> remaining = new LinkedHashMap<>(tasks);
+        Set<String> completed = new HashSet<>();
+        List<List<Task>> batches = new ArrayList<>();
+
+        while (!remaining.isEmpty()) {
+            List<Task> batch = remaining.values().stream()
+                    .filter(task -> completed.containsAll(task.getDependencies()))
+                    .toList();
+
+            if (batch.isEmpty()) {
+                break;
+            }
+
+            batches.add(batch);
+            for (Task task : batch) {
+                remaining.remove(task.getId());
+                completed.add(task.getId());
+            }
+        }
+
+        return batches;
+    }
+
+    private String compactGoal(String rawGoal, int maxLength) {
+        String singleLineGoal = rawGoal
+                .replace("\r\n", " ")
+                .replace('\r', ' ')
+                .replace('\n', ' ')
+                .trim()
+                .replaceAll(" {2,}", " ");
+        if (singleLineGoal.length() <= maxLength) {
+            return singleLineGoal;
+        }
+        return singleLineGoal.substring(0, maxLength - 3) + "...";
+    }
+
+    private String formatTaskList(List<Task> batch, int limit) {
+        if (batch.isEmpty()) {
+            return "无";
+        }
+
+        List<String> taskIds = batch.stream()
+                .map(Task::getId)
+                .toList();
+
+        if (taskIds.size() <= limit) {
+            return String.join(", ", taskIds);
+        }
+
+        return String.join(", ", taskIds.subList(0, limit)) + " 等 " + taskIds.size() + " 个任务";
+    }
+
     private String getStatusIcon(Task.TaskStatus status) {
         return switch (status) {
             case PENDING -> "⏳";
@@ -307,6 +392,8 @@ public class ExecutionPlan {
             case SKIPPED -> "⏭️";
         };
     }
+
+
 
     @Override
     public String toString() {
