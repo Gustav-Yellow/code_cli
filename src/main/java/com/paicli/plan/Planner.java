@@ -142,7 +142,8 @@ public class Planner {
         plan.setSummary(summary);
 
         // ── 第一遍：建节点，不做依赖 ──
-        Map<String, String> idMapping = new HashMap<>();  // 原id → 新id 映射
+        // 第一遍：创建所有任务（不处理依赖，因为可能有前向引用）
+        Map<String, String> idMapping = new HashMap<>(); // 原id → 新id 映射
         int taskIndex = 1;
 
         for (JsonNode taskNode : tasksNode) {

@@ -18,27 +18,18 @@ import java.util.concurrent.TimeUnit;
  * 内部使用 OkHttp 发送 HTTP 请求，使用 Jackson 进行 JSON 序列化与反序列化。
  */
 public class GLMClient {
-
-    // 配置 GLM 模型的接口地址
-    private static final String API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
-
+    private static final String API_URL = "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions";
     private static final String MODEL = "glm-5.2";
     private static final ObjectMapper mapper = new ObjectMapper();
-    private final OkHttpClient httpClient;
+    private static final OkHttpClient SHARED_HTTP_CLIENT = new OkHttpClient.Builder()
+            .connectTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .build();
     private final String apiKey;
 
-    /**
-     * 构造方法：初始化 GLM 客户端
-     *
-     * @param apiKey 智谱 AI 平台的 API 密钥，用于 Bearer Token 认证
-     */
     public GLMClient(String apiKey) {
         this.apiKey = apiKey;
-        // 配置 OkHttp 客户端：连接超时 60s，读取超时 120s（LLM 生成回复耗时较长，需放宽读取超时）
-        this.httpClient = new OkHttpClient.Builder()
-                .connectTimeout(60, TimeUnit.SECONDS)
-                .readTimeout(120, TimeUnit.SECONDS)
-                .build();
     }
 
     /**
@@ -239,13 +230,17 @@ public class GLMClient {
          *   }
          * }
          */
-        try (Response response = httpClient.newCall(request).execute()) {
+        try (Response response = SHARED_HTTP_CLIENT.newCall(request).execute()) {
+            ResponseBody responseBodyObj = response.body();
             if (!response.isSuccessful()) {
-                throw new IOException("API请求失败: " + response.code() + " - " + response.body().string());
+                String errorBody = responseBodyObj != null ? responseBodyObj.string() : "无响应体";
+                throw new IOException("API请求失败: " + response.code() + " - " + errorBody);
+            }
+            if (responseBodyObj == null) {
+                throw new IOException("API返回空响应体");
             }
 
-            // 获取响应内容，并转换成 JSON 对象
-            String responseBody = response.body().string();
+            String responseBody = responseBodyObj.string();
             JsonNode root = mapper.readTree(responseBody);
 
             // 解析响应

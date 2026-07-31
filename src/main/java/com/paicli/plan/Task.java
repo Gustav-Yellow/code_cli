@@ -26,15 +26,15 @@ public class Task {
     private final String id;
     private final String description;
     private final TaskType type;
-    private TaskStatus status;
-    private String result;
-    private String error;
+    private volatile TaskStatus status;
+    private volatile String result;
+    private volatile String error;
     /** 当前任务依赖的前置任务 ID（这些任务必须先完成，当前任务才能开始） */
     private final List<String> dependencies;
     /** 依赖当前任务的后继任务 ID（当前任务完成后，这些任务才可能变得可执行） */
     private final List<String> dependents;
-    private long startTime;
-    private long endTime;
+    private volatile long startTime;
+    private volatile long endTime;
 
     /**
      * 任务类型 —— 决定了 {@code PlanExecuteAgent.executeTask()} 中传给 LLM 的执行提示词的 tone。
