@@ -147,13 +147,16 @@ paicli/
     - SUPPLEMENT 时将补充要求拼接到原 goal，重新 `planner.createPlan()` 并再次审查
     - 用户可多次补充要求，直到满意或放弃
   - **分批并发执行**：`executePlan()` 用 `while(true) + getExecutableTasksInOrder()` 逐轮计算可执行任务
-    - 单任务：直接在当前线程执行
-    - 多任务：用 `ExecutorService` 线程池并行执行（前提是同批次内任务互不依赖）
+    - 单任务：直接在当前线程执行，避免线程池开销
+    - 多任务：用 `ExecutorService` 线程池并行执行（**并发上限 4**，防止资源耗尽）
     - 僵局检测：while 退出但计划未完成且无失败 → 存在无法满足的依赖
-  - **executeTask()**：每个 Task 独立调 LLM，不维护跨 Task 对话历史；依赖通过 `buildTaskContext()` 注入
+  - **executeTask() 多轮工具调用**：单个 Task 内支持 ReAct 风格的多轮 LLM + 工具循环
+    - `MAX_TASK_ITERATIONS = 5` 限制单 Task 最大迭代次数，防止无限循环
+    - 消息历史在 Task 内维护，跨 Task 通过 `buildTaskContext()` 传递依赖结果
+    - 工具结果回灌到消息历史，LLM 可基于结果决定下一步操作
   - **失败恢复**：失败 + 进度 < 50% 时触发 `Planner.replan()`
 - 内部类型：`TaskExecutionResult`（封装成功/失败结果）、`PlanReviewHandler`（审查回调接口）、`PlanReviewAction`（EXECUTE/SUPPLEMENT/CANCEL）、`PlanReviewDecision`（决策 + 补充说明）
-- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 6、7、9 节
+- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 6、7、9、14 节
 
 ### 4.6 `plan.Planner` — LLM 任务分解（第 2 期）
 

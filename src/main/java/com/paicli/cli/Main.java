@@ -2,6 +2,8 @@ package com.paicli.cli;
 
 import com.paicli.agent.Agent;
 import com.paicli.agent.PlanExecuteAgent;
+import com.paicli.llm.GLMClient;
+import com.paicli.memory.MemoryManager;
 import com.paicli.plan.ExecutionPlan;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
@@ -16,22 +18,15 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * PaiCLI v2.0 — Plan-and-Execute Agent CLI。
- *
- * <h3>模式路由</h3>
- * 默认使用 ReAct（Agent.java），用户通过 /plan 命令切换到 Plan-and-Execute 模式：
- * <ul>
- *   <li>/plan → 下一条输入走 Plan 模式，执行完毕后自动回到 ReAct</li>
- *   <li>/plan 任务内容 → 直接用 Plan 模式执行该任务</li>
- * </ul>
- *
- * <h3>JLine 终端</h3>
- * 使用 JLine 替代 Scanner，支持 raw mode 单键读取（计划审查）、括号粘贴、Ctrl+C/D 处理。
+ * PaiCLI v3.0 - Memory-Enhanced Agent CLI
+ * 支持 ReAct、Plan-and-Execute 与 Memory 能力
  */
 public class Main {
-    private static final String VERSION = "2.0.0";
+    private static final String VERSION = "3.0.0";
     private static final String ENV_FILE = ".env";
 
     /** 终端括号粘贴模式的前缀标记（xterm 扩展） */
@@ -93,8 +88,12 @@ public class Main {
                     .build();
             lineReader.option(LineReader.Option.BRACKETED_PASTE, true);
 
+            // 会话级共享上下文：ReAct 与 Plan 共享同一份对话历史与长期记忆
+            MemoryManager sharedMemory = new MemoryManager(new GLMClient(apiKey));
+            List<GLMClient.Message> sharedHistory = new ArrayList<>();
+
             // 默认使用 ReAct 模式
-            Agent reactAgent = new Agent(apiKey);
+            Agent reactAgent = new Agent(apiKey, sharedHistory, sharedMemory);
             System.out.println("🔄 使用 ReAct 模式\n");
             // nextTaskUsePlanMode：/plan 命令设置此标记，下一条输入走 Plan 模式
             boolean nextTaskUsePlanMode = false;
@@ -105,6 +104,8 @@ public class Main {
             System.out.println("   - 输入 '/plan 任务内容' 直接用计划模式执行这条任务");
             System.out.println("   - 计划生成后可直接执行、补充要求重规划，或取消");
             System.out.println("   - 默认模式是 ReAct");
+            System.out.println("   - 输入 '/memory' 查看记忆状态");
+            System.out.println("   - 输入 '/save 事实内容' 手动保存关键事实");
             System.out.println("   - 输入 '/clear' 清空对话历史");
             System.out.println("   - 输入 '/exit' 或 '/quit' 退出\n");
 
@@ -132,6 +133,7 @@ public class Main {
                     continue;
                 }
 
+                // 解析 CLI 命令
                 CliCommandParser.ParsedCommand command = CliCommandParser.parse(input);
                 switch (command.type()) {
                     case EXIT -> {
@@ -140,17 +142,29 @@ public class Main {
                     }
                     case CLEAR -> {
                         reactAgent.clearHistory();
-                        System.out.println("🗑️ 对话历史已清空\n");
+                        System.out.println("🗑️ 对话历史已清空，关键事实已保存到长期记忆\n");
                         continue;
                     }
-                    // /plan（无参数）：标记下一条输入走 Plan 模式，ESC 可取消
+                    case MEMORY_STATUS -> {
+                        System.out.println("📋 记忆系统状态：");
+                        System.out.println(reactAgent.getMemoryManager().getSystemStatus());
+                        System.out.println();
+                        continue;
+                    }
+                    case MEMORY_SAVE -> {
+                        String fact = command.payload();
+                        if (fact != null && !fact.isEmpty()) {
+                            reactAgent.getMemoryManager().storeFact(fact);
+                            System.out.println("💾 已保存到长期记忆: " + fact + "\n");
+                        }
+                        continue;
+                    }
                     case SWITCH_PLAN -> {
                         if (command.payload() == null || command.payload().isEmpty()) {
                             nextTaskUsePlanMode = true;
                             System.out.println("📋 下一条任务将使用 Plan-and-Execute 模式，输入任务前按 ESC 可取消，执行完成后自动回到默认 ReAct。\n");
                             continue;
                         }
-                        // /plan 带 payload：直接走 Plan 模式执行该内容
                         input = command.payload();
                     }
                     case NONE -> {
@@ -161,7 +175,7 @@ public class Main {
                 System.out.println();
                 String response;
                 if (nextTaskUsePlanMode || command.type() == CliCommandParser.CommandType.SWITCH_PLAN) {
-                    PlanExecuteAgent planAgent = createPlanAgent(apiKey, terminal, lineReader);
+                    PlanExecuteAgent planAgent = createPlanAgent(apiKey, terminal, lineReader, sharedHistory, sharedMemory);
                     response = planAgent.run(input);
                     nextTaskUsePlanMode = false;  // 执行完毕后回到 ReAct
                 } else {
@@ -183,9 +197,10 @@ public class Main {
      * 创建带交互式审查的 PlanExecuteAgent —— 注入 PlanReviewHandler，
      * 让用户在计划生成后能预览、补充要求、取消或直接执行。
      */
-    private static PlanExecuteAgent createPlanAgent(String apiKey, Terminal terminal, LineReader lineReader) {
+    private static PlanExecuteAgent createPlanAgent(String apiKey, Terminal terminal, LineReader lineReader,
+                                                    List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
         System.out.println("📋 使用 Plan-and-Execute 模式\n");
-        return new PlanExecuteAgent(apiKey, createPlanReviewHandler(terminal, lineReader));
+        return new PlanExecuteAgent(apiKey, createPlanReviewHandler(terminal, lineReader), sharedHistory, sharedMemory);
     }
 
     /**
@@ -586,10 +601,18 @@ public class Main {
     }
 
     private static void printBanner() {
-        System.out.println("========================================");
-        System.out.println("           PaiCLI v" + VERSION);
-        System.out.println("      Plan-and-Execute Agent CLI");
-        System.out.println("========================================");
+        System.out.println("╔══════════════════════════════════════════════════════════╗");
+        System.out.println("║                                                          ║");
+        System.out.println("║   ██████╗  █████╗ ██╗ ██████╗██╗     ██╗                ║");
+        System.out.println("║   ██╔══██╗██╔══██╗██║██╔════╝██║     ██║                ║");
+        System.out.println("║   ██████╔╝███████║██║██║     ██║     ██║                ║");
+        System.out.println("║   ██╔═══╝ ██╔══██║██║██║     ██║     ██║                ║");
+        System.out.println("║   ██║     ██║  ██║██║╚██████╗███████╗██║                ║");
+        System.out.println("║   ╚═╝     ╚═╝  ╚═╝╚═╝ ╚═════╝╚══════╝╚═╝                ║");
+        System.out.println("║                                                          ║");
+        System.out.printf("║      Memory-Enhanced Agent CLI %-8s                 ║%n", "v" + VERSION);
+        System.out.println("║                                                          ║");
+        System.out.println("╚══════════════════════════════════════════════════════════╝");
         System.out.println();
     }
 }

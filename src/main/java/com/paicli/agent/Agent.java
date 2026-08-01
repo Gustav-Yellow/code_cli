@@ -1,6 +1,7 @@
 package com.paicli.agent;
 
 import com.paicli.llm.GLMClient;
+import com.paicli.memory.MemoryManager;
 import com.paicli.tool.ToolRegistry;
 
 import java.io.IOException;
@@ -12,6 +13,7 @@ public class Agent {
     private final GLMClient llmClient;
     private final ToolRegistry toolRegistry;
     private final List<GLMClient.Message> conversationHistory;
+    private final MemoryManager memoryManager;
     private static final int MAX_ITERATIONS = 10;
 
     // 系统提示词，给 Agent 限定身份
@@ -27,24 +29,41 @@ public class Agent {
 
             当需要操作文件、执行命令或创建项目时，请使用工具调用。
             使用工具后，根据工具返回的结果继续思考下一步行动。
+            
+            如果提供了相关记忆，请参考其中的信息来辅助决策。
 
             请用中文回复用户。
             """;
 
     public Agent(String apiKey) {
+        this(apiKey, new ArrayList<>(), new MemoryManager(new GLMClient(apiKey)));
+    }
+
+    /**
+     * 共享上下文构造器：注入会话级 conversationHistory 与 MemoryManager，
+     * 让 ReAct 与 Plan 模式共享同一份对话记忆与长期记忆。
+     */
+    public Agent(String apiKey, List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
         this.llmClient = new GLMClient(apiKey);
         this.toolRegistry = new ToolRegistry();
-        this.conversationHistory = new ArrayList<>();
+        this.conversationHistory = sharedHistory;
+        this.memoryManager = sharedMemory;
 
-        // 添加系统提示
-        conversationHistory.add(GLMClient.Message.system(SYSTEM_PROMPT));
+        // 保证 index 0 是 system prompt（供 Plan 后续追加、压缩保留 index 0）
+        if (conversationHistory.isEmpty()) {
+            conversationHistory.add(GLMClient.Message.system(SYSTEM_PROMPT));
+        }
     }
 
     /**
      * 运行 Agent 循环
      */
     public String run(String userInput) {
-        // 添加用户输入到历史
+        // 先检索相关长期记忆并注入 system prompt（检索在写入历史之前，避免自匹配）
+        String memoryContext = memoryManager.buildContextForQuery(userInput, 500);
+        updateSystemPromptWithMemory(memoryContext);
+
+        // 添加用户输入到历史（保持原文，不污染 user message）
         conversationHistory.add(GLMClient.Message.user(userInput));
 
         System.out.println("🤔 思考中...\n");
@@ -54,11 +73,17 @@ public class Agent {
             iteration++;
 
             try {
+                // 调用 LLM 前检查并压缩历史（超预算时用摘要替换旧消息）
+                memoryManager.compressContextIfNeeded(conversationHistory);
+
                 // 调用 LLM
                 GLMClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
                         toolRegistry.getToolDefinitions()
                 );
+
+                // 记录本次调用的 token 使用（覆盖工具调用与最终响应两条分支）
+                memoryManager.recordTokenUsage(response.inputTokens(), response.outputTokens());
 
                 // 如果有工具调用
                 if (response.hasToolCalls()) {
@@ -82,7 +107,7 @@ public class Agent {
                         System.out.println("   结果: " + toolResult.substring(0, Math.min(200, toolResult.length()))
                                 + (toolResult.length() > 200 ? "..." : "") + "\n");
 
-                        // 添加工具结果到历史
+                        // 添加工具结果到对话历史
                         conversationHistory.add(GLMClient.Message.tool(toolCall.id(), toolResult));
                     }
 
@@ -109,12 +134,28 @@ public class Agent {
     }
 
     /**
-     * 清空对话历史（保留系统提示）
+     * 清空对话历史（保留系统提示），并提取关键事实到长期记忆
      */
     public void clearHistory() {
+        // 先从当前对话历史中提取关键事实
+        memoryManager.extractAndSaveFacts(conversationHistory);
+
         GLMClient.Message systemMsg = conversationHistory.get(0);
         conversationHistory.clear();
         conversationHistory.add(systemMsg);
+    }
+
+    /**
+     * 将从长期记忆检索到的 MemoryEntry 上下文注入到 system prompt 中（替换 conversationHistory[0]）
+     */
+    private void updateSystemPromptWithMemory(String memoryContext) {
+        if (memoryContext == null || memoryContext.isEmpty()) {
+            // 恢复原始 system prompt
+            conversationHistory.set(0, GLMClient.Message.system(SYSTEM_PROMPT));
+        } else {
+            String enrichedPrompt = SYSTEM_PROMPT + "\n" + memoryContext;
+            conversationHistory.set(0, GLMClient.Message.system(enrichedPrompt));
+        }
     }
 
     /**
@@ -122,5 +163,12 @@ public class Agent {
      */
     public List<GLMClient.Message> getConversationHistory() {
         return new ArrayList<>(conversationHistory);
+    }
+
+    /**
+     * 获取记忆管理器
+     */
+    public MemoryManager getMemoryManager() {
+        return memoryManager;
     }
 }

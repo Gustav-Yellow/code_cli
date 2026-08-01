@@ -1,6 +1,7 @@
 package com.paicli.agent;
 
 import com.paicli.llm.GLMClient;
+import com.paicli.memory.MemoryManager;
 import com.paicli.plan.*;
 import com.paicli.tool.ToolRegistry;
 
@@ -93,6 +94,10 @@ public class PlanExecuteAgent {
     private final Planner planner;
     /** 审查回调 —— 由 CLI 层注入，控制是否弹交互式审查界面 */
     private final PlanReviewHandler reviewHandler;
+    private final MemoryManager memoryManager;
+    /** 会话级共享对话历史 —— 与 ReAct 共享，模式切换时上下文连续 */
+    private final List<GLMClient.Message> sharedHistory;
+
 
     private static final String EXECUTION_PROMPT = """
             你是一个任务执行专家。请根据当前任务和上下文，选择合适的工具或生成回复。
@@ -103,8 +108,9 @@ public class PlanExecuteAgent {
             可用工具：
             1. read_file - 读取文件内容，参数：{"path": "文件路径"}
             2. write_file - 写入文件内容，参数：{"path": "文件路径", "content": "内容"}
-            3. execute_command - 执行命令，参数：{"command": "命令"}
-            4. create_project - 创建项目，参数：{"name": "名称", "type": "java|python|node"}
+            3. list_dir - 列出目录内容，参数：{"path": "目录路径"}
+            4. execute_command - 执行命令，参数：{"command": "命令"}
+            5. create_project - 创建项目，参数：{"name": "名称", "type": "java|python|node"}
 
             如果是ANALYSIS或VERIFICATION类型任务，请直接输出分析结果，不需要调用工具。
 
@@ -118,26 +124,74 @@ public class PlanExecuteAgent {
         this(apiKey, (goal, plan) -> PlanReviewDecision.execute());
     }
 
-    /**
-     * 带审查构造器：通过 {@link PlanReviewHandler} 注入交互逻辑。
-     * handler 为 null 时回退为直接执行。
-     */
     public PlanExecuteAgent(String apiKey, PlanReviewHandler reviewHandler) {
-        this.llmClient = new GLMClient(apiKey);
-        this.toolRegistry = new ToolRegistry();
-        this.planner = new Planner(llmClient);
+        this(new GLMClient(apiKey), new ToolRegistry(), null, new ArrayList<>(), null, reviewHandler);
+    }
+
+    /**
+     * 共享上下文构造器：注入会话级 sharedHistory 与 MemoryManager，
+     * 让 Plan 与 ReAct 共享同一份对话记忆与长期记忆。
+     */
+    public PlanExecuteAgent(String apiKey, PlanReviewHandler reviewHandler,
+                            List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
+        this(new GLMClient(apiKey), new ToolRegistry(), null, sharedHistory, sharedMemory, reviewHandler);
+    }
+
+    PlanExecuteAgent(GLMClient llmClient, ToolRegistry toolRegistry, Planner planner,
+                     List<GLMClient.Message> sharedHistory, MemoryManager memoryManager,
+                     PlanReviewHandler reviewHandler) {
+        this.llmClient = llmClient;
+        this.toolRegistry = toolRegistry != null ? toolRegistry : new ToolRegistry();
+        this.planner = planner != null ? planner : new Planner(llmClient);
         this.reviewHandler = reviewHandler == null ? (goal, plan) -> PlanReviewDecision.execute() : reviewHandler;
+        this.memoryManager = memoryManager != null ? memoryManager : new MemoryManager(llmClient);
+        this.sharedHistory = sharedHistory;
     }
 
     /**
      * 运行入口：所有输入统一走 Plan 路径（模式选择由 CLI 层负责）。
+     *
+     * <h3>共享上下文</h3>
+     * 开头压缩共享历史、取先前对话上下文供规划参考，并追加 user(goal)；
+     * 结尾把计划结果作为 assistant 消息追加回共享历史，使切回 ReAct 时上下文连续。
      */
     public String run(String userInput) {
+        // 压缩共享历史（与 ReAct 同一调用，作用于会话级历史）
+        memoryManager.compressContextIfNeeded(sharedHistory);
+        // 取先前对话上下文（在追加当前 goal 之前，避免自匹配/冗余）
+        // 默认提取前 8 条，可通过参数调整
+        String priorContext = buildPriorContext(sharedHistory, 8);
+        // 添加本轮用户消息
+        sharedHistory.add(GLMClient.Message.user(userInput));
+
         try {
-            return runWithPlan(userInput);
+            String result = runWithPlan(userInput, priorContext);
+            if (result != null && !result.isBlank()) {
+                sharedHistory.add(GLMClient.Message.assistant(result));
+            }
+            return result;
         } catch (Exception e) {
-            return "❌ 执行失败: " + e.getMessage();
+            String errorMessage = "❌ 执行失败: " + e.getMessage();
+            sharedHistory.add(GLMClient.Message.assistant(errorMessage));
+            return errorMessage;
         }
+    }
+
+    /**
+     * 从共享历史取最近 maxMessages 条（跳过 index 0 的 system prompt），
+     * 格式化为 "role: content" 供规划时参考。压缩摘要若落在窗口内自然被包含。
+     */
+    private String buildPriorContext(List<GLMClient.Message> history, int maxMessages) {
+        if (history.size() <= 1) {
+            return "";
+        }
+        int start = Math.max(1, history.size() - maxMessages);
+        StringBuilder sb = new StringBuilder();
+        for (int i = start; i < history.size(); i++) {
+            GLMClient.Message m = history.get(i);
+            sb.append(m.role()).append(": ").append(m.content()).append("\n");
+        }
+        return sb.toString();
     }
 
     /**
@@ -157,10 +211,10 @@ public class PlanExecuteAgent {
     }
 
     /**
-     * Plan 模式入口：LLM 规划 → 用户审查 → 批次执行。
+     * Plan 模式入口：LLM 规划（可带先前对话上下文）→ 用户审查 → 批次执行。
      */
-    private String runWithPlan(String goal) throws IOException {
-        ExecutionPlan plan = planner.createPlan(goal);
+    private String runWithPlan(String goal, String priorContext) throws IOException {
+        ExecutionPlan plan = planner.createPlan(goal, priorContext);
         return reviewAndExecutePlan(plan);
     }
 
@@ -275,6 +329,10 @@ public class PlanExecuteAgent {
             finalResult.append(buildFinalResult(plan));
         }
 
+        // 计划执行完成（成功或部分失败）后，用本次计划的任务结果提取关键事实到长期记忆。
+        // 放在此处而非 run()：plan 在作用域内，无需额外传参；replan/取消等提前返回路径不会触发。
+        extractFactsFromPlan(plan);
+
         // 3. 完成
         if (plan.hasFailed()) {
             plan.markFailed();
@@ -286,12 +344,28 @@ public class PlanExecuteAgent {
     }
 
     /**
+     * 用本次计划的目标 + 各任务结果构建会话历史，提取关键事实到长期记忆。
+     * 工具中间结果不纳入（事实提取的噪声），只取任务最终产出。
+     */
+    private void extractFactsFromPlan(ExecutionPlan plan) {
+        List<GLMClient.Message> sessionHistory = new ArrayList<>();
+        sessionHistory.add(GLMClient.Message.user(plan.getGoal()));
+        for (Task t : plan.getAllTasks()) {
+            if (t.getResult() != null && !t.getResult().isBlank()) {
+                sessionHistory.add(GLMClient.Message.assistant("[" + t.getId() + "] " + t.getResult()));
+            }
+        }
+        memoryManager.extractAndSaveFacts(sessionHistory);
+    }
+
+    /**
      * 获取当前可执行的任务，按拓扑序排列。
      *
      * <h3>为什么不直接用 getExecutableTasks()？</h3>
      * {@link ExecutionPlan#getExecutableTasks()} 返回所有 isExecutable==true 的任务，
      * 但不保证顺序。本方法先取可执行集合，再按拓扑序过滤，
      * 确保同一批次内的任务也保持依赖顺序。
+     * 每次返回可以并行执行的任务节点
      */
     private List<Task> getExecutableTasksInOrder(ExecutionPlan plan) {
         Set<String> executableIds = plan.getExecutableTasks().stream()
@@ -375,23 +449,27 @@ public class PlanExecuteAgent {
     private static final int MAX_TASK_ITERATIONS = 5;
 
     /**
-     * 执行单个 Task：组装 prompt → 调 LLM → 执行工具调用。
+     * 执行单个 Task：组装 prompt → 调 LLM → 执行工具调用（支持多轮工具调用）。
      *
      * <h3>每个 Task 有独立的 LLM 调用</h3>
-     * 与 {@link Agent} 的多轮对话不同，这里每个 Task 是一次性的：
+     * 与 {@link Agent} 的多轮对话不同，这里每个 Task 维护自己的局部 messages：
      * System prompt + User context（含依赖结果）→ LLM 回复/工具调用 → 直接返回。
      * 不维护跨 Task 的对话历史——依赖结果通过 {@link #buildTaskContext} 传递。
-     */
-    /**
-     * 执行单个任务（支持多轮工具调用）
      */
     private String executeTask(String goal, ExecutionPlan plan, Task task) throws IOException {
         String prompt = String.format(EXECUTION_PROMPT,
                 task.getType(), task.getDescription());
 
+        // 注入长期记忆上下文（检索与任务描述相关的长期记忆）
+        String memoryContext = memoryManager.buildContextForQuery(task.getDescription(), 300);
+        String taskInput = buildTaskContext(goal, plan, task);
+        if (!memoryContext.isEmpty()) {
+            taskInput = taskInput + "\n\n" + memoryContext;
+        }
+
         List<GLMClient.Message> messages = new ArrayList<>(Arrays.asList(
                 GLMClient.Message.system(prompt),
-                GLMClient.Message.user(buildTaskContext(goal, plan, task))
+                GLMClient.Message.user(taskInput)
         ));
 
         StringBuilder allResults = new StringBuilder();
@@ -405,11 +483,18 @@ public class PlanExecuteAgent {
                     toolRegistry.getToolDefinitions()
             );
 
+            // 记录本次调用的 token 使用（覆盖工具调用与最终响应两条分支）
+            memoryManager.recordTokenUsage(response.inputTokens(), response.outputTokens());
+
+            // 没有工具调用，返回最终结果
             if (!response.hasToolCalls()) {
-                // 没有工具调用，返回最终结果
+
+                // 如果之前存在工具调用的信息，则将工具调用结果作为最终结果返回
                 if (!allResults.isEmpty() && (response.content() == null || response.content().isBlank())) {
-                    return allResults.toString().trim();
+                    String toolOnlyResult = allResults.toString().trim();
+                    return toolOnlyResult;
                 }
+
                 return response.content();
             }
 

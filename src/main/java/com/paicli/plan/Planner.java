@@ -89,12 +89,29 @@ public class Planner {
      * @throws IOException 网络错误或 LLM 返回的计划中存在循环依赖
      */
     public ExecutionPlan createPlan(String goal) throws IOException {
+        return createPlan(goal, null);
+    }
+
+    /**
+     * 调用 LLM 将自然语言目标分解为执行计划，可附带先前对话上下文做上下文感知规划。
+     *
+     * @param goal         用户的自然语言目标
+     * @param priorContext 先前对话上下文（来自共享历史），为 null 或空时退化为无上下文规划
+     */
+    public ExecutionPlan createPlan(String goal, String priorContext) throws IOException {
         System.out.println("📋 正在规划任务: " + goal + "\n");
 
         // 构建规划请求
+        String userContent;
+        if (priorContext == null || priorContext.isBlank()) {
+            userContent = "请为以下任务制定执行计划：\n" + goal;
+        } else {
+            userContent = "【先前对话上下文】\n" + priorContext + "\n\n请参考上下文，为以下任务制定执行计划：\n" + goal;
+        }
+
         List<GLMClient.Message> messages = Arrays.asList(
                 GLMClient.Message.system(PLANNING_PROMPT),
-                GLMClient.Message.user("请为以下任务制定执行计划：\n" + goal)
+                GLMClient.Message.user(userContent)
         );
 
         // 调用LLM生成计划
