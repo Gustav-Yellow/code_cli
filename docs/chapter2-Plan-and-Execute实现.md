@@ -1327,3 +1327,47 @@ private static final int MAX_TASK_ITERATIONS = 5;
 | MAX_TASK_ITERATIONS = 5 | 无限循环风险、资源浪费、用户体验差 | `executeTask()` |
 
 这些修改在不破坏原有架构的前提下，显著提升了 Plan-and-Execute 模式的稳定性和实用性。
+
+---
+
+## 15. Memory 阶段增强（第 3 期联动）
+
+第 3 期 Memory 系统引入了**共享会话上下文**架构，PlanExecuteAgent 获得了多项增强。详见 `docs/chapter3-Memory实现.md`。
+
+### 15.1 共享会话上下文
+
+`PlanExecuteAgent` 新增构造器接收 `List<Message> sharedHistory` 和 `MemoryManager sharedMemory`，与 ReAct 的 `Agent` 共享同一份对话历史与长期记忆。
+
+`sharedHistory` 由 `Main.java` 在启动时创建，注入两个 Agent。Plan 只在 `run()` 首尾追加高层面的 `goal` 和 `result`，Task 内部的局部 `messages`（含工具调用细节）不入共享历史，避免污染。
+
+### 15.2 轮开始前压缩
+
+Plan `run()` 开头调用 `memoryManager.compressContextIfNeeded(sharedHistory)`，与 ReAct 的 `Agent.run()` 循环内同一调用。压缩超限时对 `sharedHistory` 做 Map-Reduce 摘要并替换旧消息，保证切回 ReAct 时上下文不爆。
+
+每 Task 的局部 `executeTask` 不再做压缩（删除原死代码），因为单 task 只有 1 条 user 消息、`MAX_TASK_ITERATIONS=5`，概率上不会撑爆上下文。
+
+### 15.3 上下文感知规划（Stage 2）
+
+`Planner` 新增 `createPlan(String goal, String priorContext)` 重载：
+
+```java
+// 规划前先取共享历史最近 8 条作为先前对话上下文
+String priorContext = buildPriorContext(sharedHistory, 8);
+// 跳过 index 0（system prompt）→ 按 "role: content" 格式化
+sharedHistory.add(Message.user(goal));
+ExecutionPlan plan = planner.createPlan(goal, priorContext);
+```
+
+`buildPriorContext` 取共享历史最近 N 条，跳过 index 0 system prompt。若 history 仅有 system 则返回 `""`。
+
+效果：Planner 在规划时能看到之前的 ReAct 对话内容（如用户偏好、项目信息、已创建的文件），生成的 Task 可以引用前文上下文。
+
+### 15.4 事实提取与共享长期记忆
+
+`executePlan` 末尾新增 `extractFactsFromPlan(plan)`：用 plan 的 goal + 各 task 结果构建 `List<Message>`，调用 `memoryManager.extractAndSaveFacts` → `ContextCompressor.extractFacts` → LLM 提取事实 → `LongTermMemory.store` 落盘。
+
+共享 `MemoryManager` 确保提取的事实立即可被 ReAct 的 `buildContextForQuery` 检索——无需重启进程。
+
+### 15.5 Token 统计完善
+
+`executeTask` 把 `recordTokenUsage` 上移到 `llmClient.chat` 之后、分支之前，一次调用覆盖工具调用迭代和最终响应两条分支（此前只在非工具响应时调用，漏掉了工具调用迭代的 token）。

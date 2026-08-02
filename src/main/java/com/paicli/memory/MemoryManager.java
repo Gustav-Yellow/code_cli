@@ -86,6 +86,8 @@ public class MemoryManager {
         }
         // 丢弃旧消息前，先从中提取事实到长期记忆，避免知识随摘要永久丢失
         extractAndSaveFacts(result.discarded());
+        // 将压缩生成的摘要本身也存入长期记忆，供后续检索（跨会话可见）
+        storeCompressionSummary(result.trimmed());
         history.clear();
         history.addAll(result.trimmed());
         System.out.println("   ✓ 已压缩历史对话");
@@ -113,7 +115,48 @@ public class MemoryManager {
     }
 
     /**
-     * 获取记忆系统的整体状态
+     * 将压缩生成的摘要存入长期记忆，类型为 SUMMARY，供跨会话检索。
+     * trimmed 的 index 1 为压缩生成的 Message.system("[历史对话摘要] ...")。
+     */
+    private void storeCompressionSummary(List<Message> trimmed) {
+        if (trimmed.size() <= 1) return;
+        String summaryContent = trimmed.get(1).content();
+        // 去掉 "[历史对话摘要] " 前缀，只保留摘要正文
+        String content = summaryContent.startsWith("[历史对话摘要] ")
+                ? summaryContent.substring("[历史对话摘要] ".length())
+                : summaryContent;
+        if (content.isBlank()) return;
+
+        MemoryEntry summaryEntry = new MemoryEntry(
+                "summary-" + UUID.randomUUID().toString().substring(0, 8),
+                content,
+                MemoryEntry.MemoryType.SUMMARY,
+                null,
+                MemoryEntry.estimateTokens(content)
+        );
+        longTermMemory.store(summaryEntry);
+        System.out.println("   已将压缩摘要存入长期记忆");
+    }
+
+    /**
+     * 获取记忆系统的整体状态（含对话上下文统计）。
+     *
+     * @param history 当前会话的对话历史，用于计算动态预算使用率
+     */
+    public String getSystemStatus(List<Message> history) {
+        int messageCount = history.size();
+        int usedTokens = tokenBudget.estimateCurrentHistoryTokens(history);
+        int maxBudget = tokenBudget.getAvailableForConversation();
+        double usagePct = tokenBudget.getBudgetUsagePercent(history);
+
+        return String.format("对话上下文: %d 条消息 | 估算占用 %,d / 最大 %,d tokens (%.1f%%) | 预算剩余 ~%,d\n",
+                messageCount, usedTokens, maxBudget, usagePct, maxBudget - usedTokens) +
+                longTermMemory.getStatusSummary() + "\n" +
+                tokenBudget.getUsageReport();
+    }
+
+    /**
+     * 获取记忆系统的整体状态（仅长期记忆 + Token 统计，不含对话上下文）。
      */
     public String getSystemStatus() {
         return longTermMemory.getStatusSummary() + "\n" +
