@@ -9,19 +9,18 @@ import com.paicli.rag.CodeIndex;
 import com.paicli.rag.CodeRelation;
 import com.paicli.rag.CodeRetriever;
 import com.paicli.rag.SearchResultFormatter;
+import org.jline.reader.*;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 import org.jline.terminal.Attributes;
-import org.jline.reader.LineReader;
-import org.jline.reader.LineReaderBuilder;
-import org.jline.reader.MaskingCallback;
-import org.jline.reader.EndOfFileException;
-import org.jline.reader.UserInterruptException;
+import org.jline.utils.NonBlockingReader;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -32,13 +31,31 @@ import java.util.List;
 public class Main {
     private static final String VERSION = "4.0.0";
     private static final String ENV_FILE = ".env";
+    private static final String LOG_DIR_PROPERTY = "paicli.log.dir";
+    private static final String LOG_LEVEL_PROPERTY = "paicli.log.level";
+    private static final String LOG_MAX_HISTORY_PROPERTY = "paicli.log.maxHistory";
+    private static final String LOG_MAX_FILE_SIZE_PROPERTY = "paicli.log.maxFileSize";
+    private static final String LOG_TOTAL_SIZE_CAP_PROPERTY = "paicli.log.totalSizeCap";
 
     /** 终端括号粘贴模式的前缀标记（xterm 扩展） */
     private static final String BRACKETED_PASTE_BEGIN = "[200~";
     /** 终端括号粘贴模式的后缀标记 */
     private static final String BRACKETED_PASTE_END = "\u001b[201~";
+
+    private static final String ARROW_UP = "[A";
+    private static final String ARROW_DOWN = "[B";
+    private static final String APP_ARROW_UP = "OA";
+    private static final String APP_ARROW_DOWN = "OB";
+
     /** Ctrl+O 的 ASCII 码，用于展开完整计划视图 */
     private static final int CTRL_O = 15;
+
+    enum EscapeSequenceType {
+        STANDALONE_ESC,
+        BRACKETED_PASTE,
+        CONTROL_SEQUENCE,
+        OTHER
+    }
 
     /**
      * readPromptInput 的返回值 —— text 是用户输入内容，canceled 表示用户按 ESC 取消。
@@ -72,8 +89,28 @@ public class Main {
         }
     }
 
+    /**
+     * readKeyFromTerminal 的返回值 —— 解析 raw mode 下第一个按键的意图。
+     * @param key 按键的 ASCII 码
+     * @param ignoredControlSequence 是否忽略了控制序列（如 ESC 或 Ctrl+C）
+     */
+    private record KeyReadResult(Integer key, boolean ignoredControlSequence) {
+        static KeyReadResult keyPressed(int key) {
+            return new KeyReadResult(key, false);
+        }
+
+        static KeyReadResult ignoredSequence() {
+            return new KeyReadResult(null, true);
+        }
+
+        static KeyReadResult unavailable() {
+            return new KeyReadResult(null, false);
+        }
+    }
+
     public static void main(String[] args) {
         printBanner();
+        configureLogging();
 
         // 加载 .env 全部配置到 System properties，返回 GLM_API_KEY
         String apiKey = loadEnvConfig();
@@ -142,6 +179,11 @@ public class Main {
                 // 解析 CLI 命令
                 CliCommandParser.ParsedCommand command = CliCommandParser.parse(input);
                 switch (command.type()) {
+                    case UNKNOWN_COMMAND -> {
+                        System.out.println("❌ 未知命令: " + command.payload());
+                        System.out.println("可用命令：/plan /clear /memory /save /index /search /graph /exit\n");
+                        continue;
+                    }
                     case EXIT -> {
                         System.out.println("\n👋 再见!");
                         return;
@@ -260,8 +302,12 @@ public class Main {
                 } else {
                     response = reactAgent.run(input);
                 }
-                System.out.println("🤖 Agent: " + response);
-                System.out.println();
+
+                if (response != null && !response.isEmpty()) {
+                    System.out.println("🤖 Agent: " + response);
+                    System.out.println();
+                }
+
             }
 
         } catch (IOException e) {
@@ -306,7 +352,7 @@ public class Main {
         System.out.print(prompt);
         System.out.flush();
 
-        PrefillResult prefill = readPrefillInputFromTerminal(terminal);
+        PrefillResult prefill = readPrefillInputFromTerminal(terminal, lineReader);
         if (prefill == null) {
             return PromptInput.submitted(lineReader.readLine(""));
         }
@@ -356,7 +402,12 @@ public class Main {
             System.out.println("   - I：输入补充要求后重新规划\n");
 
             while (true) {
-                Integer key = readSingleKeyFromTerminal(terminal);
+                KeyReadResult keyReadResult = readSingleKeyFromTerminal(terminal);
+                if (keyReadResult.ignoredControlSequence()) {
+                    continue;
+                }
+                Integer key = keyReadResult.key();
+
                 if (key != null) {
                     // Enter (13 或 10)
                     if (key == '\n' || key == '\r') {
@@ -414,55 +465,38 @@ public class Main {
         };
     }
 
-    /**
-     * 进入 raw mode 读取单个按键，读取后恢复终端属性。
-     *
-     * <h3>为什么读完后 drain ESC 序列？</h3>
-     * 终端的方向键、功能键以 ESC (27) 开头后跟 [A/[B/[C/[D 等字节序列。
-     * 如果用户误按方向键，只读到 ESC 而后续字节残留在输入缓冲区，
-     * 下次 read 会读到脏数据。drain 确保缓冲区干净。
-     *
-     * @return 按键的 ASCII/Unicode 码点，读取失败返回 null
-     */
-    private static Integer readSingleKeyFromTerminal(Terminal terminal) {
+    private static KeyReadResult readSingleKeyFromTerminal(Terminal terminal) {
         try {
             terminal.flush();
             Attributes originalAttributes = terminal.enterRawMode();
             try {
                 int key = terminal.reader().read();
                 if (key < 0) {
-                    return null;
+                    return KeyReadResult.unavailable();
                 }
 
-                // 如果是 ESC，需要 drain 掉后续的方向键序列字节
                 if (key == 27) {
-                    drainEscapeSequence(terminal);
+                    String escapeSequence = readInputBurst(terminal, 80, 20, 120);
+                    EscapeSequenceType escapeSequenceType = classifyEscapeSequence(escapeSequence);
+                    if (escapeSequenceType == EscapeSequenceType.STANDALONE_ESC) {
+                        return KeyReadResult.keyPressed(27);
+                    }
+                    if (escapeSequenceType == EscapeSequenceType.CONTROL_SEQUENCE
+                            || escapeSequenceType == EscapeSequenceType.BRACKETED_PASTE) {
+                        return KeyReadResult.ignoredSequence();
+                    }
                 }
 
-                return key;
+                return KeyReadResult.keyPressed(key);
             } finally {
                 terminal.setAttributes(originalAttributes);
             }
         } catch (Exception e) {
-            return null;
+            return KeyReadResult.unavailable();
         }
     }
 
-    /**
-     * 在 raw mode 下读取第一个字符，判断用户意图。
-     *
-     * <h3>三种分支</h3>
-     * <ul>
-     *   <li>ESC (27) → 进一步读后续字节，判断是取消还是括号粘贴</li>
-     *   <li>Enter → 空提交（用户直接回车）</li>
-     *   <li>其他字符 → 用户开始输入，继续 burst read 剩余字节后作为 seed buffer</li>
-     * </ul>
-     *
-     * <h3>退格键处理</h3>
-     * 退格 (8/127) 被视为空字符串，因为 seed buffer 中不应该包含退格字符——
-     * 用户按退格意味着清空了预填内容。
-     */
-    private static PrefillResult readPrefillInputFromTerminal(Terminal terminal) {
+    private static PrefillResult readPrefillInputFromTerminal(Terminal terminal, LineReader lineReader) {
         try {
             terminal.flush();
             Attributes originalAttributes = terminal.enterRawMode();
@@ -473,7 +507,7 @@ public class Main {
                 }
 
                 if (key == 27) {
-                    return readEscapeInput(terminal);
+                    return readEscapeInput(terminal, lineReader);
                 }
 
                 if (isSubmitKey(key)) {
@@ -504,13 +538,14 @@ public class Main {
      * 如果匹配 → 循环读取直到遇到粘贴后缀 → 提取中间文本作为 seed buffer。
      * 如果不匹配 → 纯 ESC → 用户取消。
      */
-    private static PrefillResult readEscapeInput(Terminal terminal) throws IOException, InterruptedException {
-        String sequence = readInputBurst(terminal, 30, 25, 250);
-        if (sequence.isEmpty()) {
+    private static PrefillResult readEscapeInput(Terminal terminal, LineReader lineReader) throws IOException, InterruptedException {
+        String sequence = readInputBurst(terminal, 80, 20, 300);
+        EscapeSequenceType escapeSequenceType = classifyEscapeSequence(sequence);
+        if (escapeSequenceType == EscapeSequenceType.STANDALONE_ESC) {
             return PrefillResult.canceledInput();
         }
 
-        if (sequence.startsWith(BRACKETED_PASTE_BEGIN)) {
+        if (escapeSequenceType == EscapeSequenceType.BRACKETED_PASTE) {
             String pastedText = sequence.substring(BRACKETED_PASTE_BEGIN.length());
             while (!pastedText.contains(BRACKETED_PASTE_END)) {
                 String burst = readInputBurst(terminal, 30, 25, 500);
@@ -521,6 +556,10 @@ public class Main {
             }
 
             return PrefillResult.seed(prepareSeedBuffer(stripBracketedPasteEndMarker(pastedText)));
+        }
+
+        if (escapeSequenceType == EscapeSequenceType.CONTROL_SEQUENCE) {
+            return PrefillResult.seed(seedBufferForHistoryNavigation(lineReader, sequence));
         }
 
         return PrefillResult.canceledInput();
@@ -544,32 +583,18 @@ public class Main {
      */
     private static String readInputBurst(Terminal terminal, long firstWaitMs, long idleWaitMs, long maxWaitMs)
             throws IOException, InterruptedException {
+        NonBlockingReader reader = terminal.reader();
         StringBuilder buffer = new StringBuilder();
         long start = System.currentTimeMillis();
-        long firstDeadline = start + firstWaitMs;
-        long idleDeadline = 0;
+        long waitMs = firstWaitMs;
 
         while (System.currentTimeMillis() - start < maxWaitMs) {
-            if (terminal.reader().ready()) {
-                int next = terminal.reader().read();
-                if (next < 0) {
-                    break;
-                }
-                buffer.append((char) next);
-                idleDeadline = System.currentTimeMillis() + idleWaitMs;
-                continue;
-            }
-
-            long now = System.currentTimeMillis();
-            if (buffer.isEmpty()) {
-                if (now >= firstDeadline) {
-                    break;
-                }
-            } else if (now >= idleDeadline) {
+            int next = reader.read(waitMs);
+            if (next == NonBlockingReader.READ_EXPIRED || next < 0) {
                 break;
             }
-
-            Thread.sleep(5);
+            buffer.append((char) next);
+            waitMs = idleWaitMs;
         }
 
         return buffer.toString();
@@ -661,23 +686,55 @@ public class Main {
         return key == '\n' || key == '\r';
     }
 
-    /**
-     * 在读到 ESC 后清空终端缓冲区中的残留字节。
-     *
-     * 方向键（上/下/左/右）和功能键（F1-F12）都以 ESC 开头后跟多字节序列。
-     * 用户可能误按方向键，此时只读到了 ESC，后续的 [A/[B 等字节还残留在缓冲区。
-     * 短暂 sleep 50ms 等后续字节全部到达后全部 drain 掉，防止污染下一次读取。
-     */
-    private static void drainEscapeSequence(Terminal terminal) {
-        try {
-            // 短暂等待，让后续字节到达
-            Thread.sleep(50);
-            // 检查并丢弃所有待读字节（如方向键序列 [A, [B 等）
-            while (terminal.reader().ready()) {
-                terminal.reader().read();
-            }
-        } catch (Exception ignored) {
+    static EscapeSequenceType classifyEscapeSequence(String sequence) {
+        if (sequence == null || sequence.isEmpty()) {
+            return EscapeSequenceType.STANDALONE_ESC;
         }
+        if (sequence.startsWith(BRACKETED_PASTE_BEGIN)) {
+            return EscapeSequenceType.BRACKETED_PASTE;
+        }
+        if (sequence.startsWith("[") || sequence.startsWith("O")) {
+            return EscapeSequenceType.CONTROL_SEQUENCE;
+        }
+        return EscapeSequenceType.OTHER;
+    }
+
+    static String seedBufferForHistoryNavigation(LineReader lineReader, String sequence) {
+        if (lineReader == null || sequence == null || sequence.isEmpty()) {
+            return "";
+        }
+
+        if (isUpArrowSequence(sequence)) {
+            return latestHistoryEntry(lineReader.getHistory());
+        }
+
+        if (isDownArrowSequence(sequence)) {
+            return "";
+        }
+
+        return "";
+    }
+
+    private static boolean isUpArrowSequence(String sequence) {
+        return ARROW_UP.equals(sequence) || APP_ARROW_UP.equals(sequence);
+    }
+
+    private static boolean isDownArrowSequence(String sequence) {
+        return ARROW_DOWN.equals(sequence) || APP_ARROW_DOWN.equals(sequence);
+    }
+
+    private static String latestHistoryEntry(History history) {
+        if (history == null || history.isEmpty()) {
+            return "";
+        }
+
+        int lastIndex = history.last();
+        if (lastIndex < 0) {
+            return "";
+        }
+
+        String entry = history.get(lastIndex);
+        return entry == null ? "" : entry;
     }
 
     /**
@@ -702,11 +759,6 @@ public class Main {
      *   <li>用户主目录 {@code ~/.env}</li>
      *   <li>OS 环境变量（已在 System.getenv 中，无需 setProperty）</li>
      * </ol>
-     *
-     * <p>这样 {@link com.paicli.rag.EmbeddingClient#getEnv(String, String)} 的
-     * {@code System.getProperty(key)} 回退路径就能命中 .env 中的
-     * {@code EMBEDDING_PROVIDER} / {@code EMBEDDING_MODEL} / {@code EMBEDDING_API_KEY}
-     * 等配置，不再需要把这些变量 export 到真正的 OS 环境变量中。</p>
      *
      * @return GLM_API_KEY 的值，找不到返回 null
      */
@@ -759,6 +811,95 @@ public class Main {
         } catch (IOException e) {
             System.err.println("读取 .env 文件失败: " + e.getMessage());
         }
+    }
+
+    private static void configureLogging() {
+        configureLogProperty(LOG_DIR_PROPERTY, "PAICLI_LOG_DIR",
+                Path.of(System.getProperty("user.home"), ".paicli", "logs").toString());
+        configureLogProperty(LOG_LEVEL_PROPERTY, "PAICLI_LOG_LEVEL", "INFO");
+        configureLogProperty(LOG_MAX_HISTORY_PROPERTY, "PAICLI_LOG_MAX_HISTORY", "7");
+        configureLogProperty(LOG_MAX_FILE_SIZE_PROPERTY, "PAICLI_LOG_MAX_FILE_SIZE", "10MB");
+        configureLogProperty(LOG_TOTAL_SIZE_CAP_PROPERTY, "PAICLI_LOG_TOTAL_SIZE_CAP", "100MB");
+
+        try {
+            Files.createDirectories(Path.of(System.getProperty(LOG_DIR_PROPERTY)));
+        } catch (IOException e) {
+            System.err.println("⚠️ 创建日志目录失败: " + e.getMessage());
+        }
+    }
+
+    private static void configureLogProperty(String propertyName, String envKey, String defaultValue) {
+        String configuredValue = System.getProperty(propertyName);
+        if (configuredValue == null || configuredValue.isBlank()) {
+            configuredValue = loadConfigValue(envKey, defaultValue);
+        }
+        if (configuredValue != null && !configuredValue.isBlank()) {
+            if (LOG_DIR_PROPERTY.equals(propertyName)) {
+                configuredValue = expandHome(configuredValue.trim());
+            }
+            System.setProperty(propertyName, configuredValue.trim());
+        }
+    }
+
+    private static String expandHome(String value) {
+        if (value == null || value.isBlank()) {
+            return value;
+        }
+        if (value.equals("~")) {
+            return System.getProperty("user.home");
+        }
+        if (value.startsWith("~/")) {
+            return Path.of(System.getProperty("user.home"), value.substring(2)).toString();
+        }
+        return value;
+    }
+
+    private static String loadConfigValue(String key, String defaultValue) {
+        String sysValue = System.getProperty(key);
+        if (sysValue != null && !sysValue.isBlank()) {
+            return sysValue.trim();
+        }
+
+        String envValue = System.getenv(key);
+        if (envValue != null && !envValue.isBlank()) {
+            return envValue.trim();
+        }
+
+        File currentEnv = new File(ENV_FILE);
+        if (currentEnv.exists()) {
+            String value = readValueFromFile(currentEnv, key);
+            if (value != null && !value.isBlank()) {
+                return value.trim();
+            }
+        }
+
+        File homeEnv = new File(System.getProperty("user.home"), ENV_FILE);
+        if (homeEnv.exists()) {
+            String value = readValueFromFile(homeEnv, key);
+            if (value != null && !value.isBlank()) {
+                return value.trim();
+            }
+        }
+
+        return defaultValue;
+    }
+
+    private static String readValueFromFile(File file, String key) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) {
+                    continue;
+                }
+                if (line.startsWith(key + "=")) {
+                    return line.substring((key + "=").length()).trim();
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("读取 .env 文件失败: " + e.getMessage());
+        }
+        return null;
     }
 
     private static void printBanner() {

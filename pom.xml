@@ -44,12 +44,7 @@
             <version>4.12.0</version>
         </dependency>
 
-        <!-- 日志 -->
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-simple</artifactId>
-            <version>2.0.9</version>
-        </dependency>
+        <!-- 日志：logback-classic 同时提供 slf4j 绑定和日志实现，见下方单独声明 -->
 
         <!-- 测试 -->
         <dependency>
@@ -66,6 +61,12 @@
             <version>3.26.3</version>
         </dependency>
 
+        <!-- 日志 -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>1.5.18</version>
+        </dependency>
 
         <!-- 中文分词 -->
         <dependency>

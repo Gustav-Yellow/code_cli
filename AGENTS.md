@@ -12,10 +12,10 @@
 
 - **语言 / 运行时**：Java 17
 - **构建**：Maven（`pom.xml` 继承 `spring-boot-starter-parent` 4.1.0，但项目本身**未使用 Spring**，只是借用 parent POM 的依赖管理；主程序是纯 Java 入口）
-- **核心依赖**：OkHttp 4.12（HTTP）、Jackson 2.16（JSON）、slf4j-simple 2.0（日志）、JLine 3.26（终端）、jieba-analysis 1.0.2（中文分词）、sqlite-jdbc 3.49（SQLite）、javaparser-core 3.28（AST 解析）
-- **默认 LLM**：智谱 GLM-5.2（`https://open.bigmodel.cn/api/paas/v4/chat/completions`），OpenAI 兼容协议
+- **核心依赖**：OkHttp 4.12（HTTP）、Jackson 2.16（JSON）、Logback 1.5（日志）、JLine 3.26（终端）、jieba-analysis 1.0.2（中文分词）、sqlite-jdbc 3.49（SQLite）、javaparser-core 3.28（AST 解析）
+- **默认 LLM**：智谱 GLM-5.2（`https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），OpenAI 兼容协议
 - **入口类**：`com.paicli.cli.Main`
-- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 5–21 期见 ROADMAP.md
+- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5–21 期见 ROADMAP.md
 
 设计哲学：**手写优先，框架在后**。21 期主线全部手写完成后，才会开启 Pro 分支用 Spring AI / LangGraph4J 重构做对照实现。日常开发不要提前引入 Spring / LangChain4j 等框架抽象。
 
@@ -33,7 +33,8 @@ paicli/
 │   ├── chapter1-ReAct和Tool Call实现.md
 │   ├── chapter2-Plan-and-Execute实现.md
 │   ├── chapter3-Memory实现.md
-│   └── chapter4-RAG开发.md
+│   ├── chapter4-RAG开发.md
+│   └── chapter4.1-Streaming_and_Log实现.md
 └── src/main/java/com/paicli/
     ├── cli/
     │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令
@@ -71,7 +72,11 @@ paicli/
     │   ├── RagQueryTokenizer.java     # 查询分词器（jieba + ASCII 标识符）
     │   └── SearchResultFormatter.java # 检索结果格式化（CLI / Tool 双模式）
     └── util/
-        └── JiebaSegmenterFactory.java # jieba 分词器静默构造工厂
+        ├── AnsiStyle.java               # ANSI 终端样式辅助类
+        ├── JiebaSegmenterFactory.java   # jieba 分词器静默构造工厂
+        └── TerminalMarkdownRenderer.java # 流式 Markdown 终端渲染器
+└── src/main/resources/
+    └── logback.xml                      # Logback 日志滚动配置
 ```
 
 > 后续期次会新增 `mcp/`、`hitl/`、`skill/`、`tui/` 等包。新增包时请在上方目录树补一行，并在第 4 节追加模块说明。
@@ -128,42 +133,57 @@ paicli/
 
 > 每个 module 一节。新增类时请在本节追加；重构类时请同步更新。
 
-### 4.1 `cli.Main` — CLI 入口（第 1 期基础，第 2/4 期增强）
+### 4.1 `cli.Main` — CLI 入口（第 1 期基础，第 2/4/4.1 期增强）
 
 - 文件：`src/main/java/com/paicli/cli/Main.java`、`src/main/java/com/paicli/cli/CliCommandParser.java`、`src/main/java/com/paicli/cli/PlanReviewInputParser.java`
 - 职责：
   - 启动 banner 打印
+  - **日志配置**：`configureLogging()` 初始化 Logback（日志目录、级别、滚动策略），`configureLogProperty()` 支持系统属性 → 环境变量 → `.env` 三层回退
   - **`.env` 全量加载**：`loadEnvConfig()` 解析 `.env` 中所有 `KEY=VALUE` → `System.setProperty()`，使 `EmbeddingClient`、`GLMClient` 等组件通过 `System.getProperty(key)` 即可读取配置
   - API Key 加载顺序：当前目录 `.env` → `~/.env` → 环境变量 `GLM_API_KEY`
-  - **JLine 终端控制**：raw mode 单键读取、括号粘贴处理、ESC 序列 draining
-  - **模式路由**：`/plan` 命令切换到 Plan 模式；`/index` `/search` `/graph` 触发 RAG 功能
+  - **JLine 终端控制**：raw mode 单键读取、ESC 序列分类（`EscapeSequenceType`）、方向键历史导航填充（`seedBufferForHistoryNavigation`）、括号粘贴处理、`NonBlockingReader` 优化输入读取
+  - **模式路由**：`/plan` 命令切换到 Plan 模式；`/index` `/search` `/graph` 触发 RAG 功能；未知 `/` 命令显示可用命令列表
   - **计划审查**：通过 `createPlanReviewHandler()` 注入 `PlanReviewHandler`
   - ReAct 模式：`Agent.run()` 循环调用 LLM + 工具
   - Plan 模式：`PlanExecuteAgent.run()` 先规划后执行
+  - **流式输出适配**：空响应（已流式输出过）不重复打印
 - 关键约定：API Key 找不到时直接 `System.exit(1)`，不进入交互循环
-- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 8 节 + `docs/chapter4-RAG开发.md` 第 6 节
+- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 8 节 + `docs/chapter4-RAG开发.md` 第 6 节 + `docs/chapter4.1-Streaming_and_Log实现.md` 第 8-9 节
 
-### 4.2 `agent.Agent` — ReAct 循环（第 1 期）
+### 4.2 `agent.Agent` — ReAct 循环（第 1 期基础，第 4.1 期增强）
 
 - 文件：`src/main/java/com/paicli/agent/Agent.java`
 - 职责：维护 `conversationHistory`，循环调用 LLM 直到无工具调用或达到 `MAX_ITERATIONS=10`
 - 核心循环（详见 `docs/chapter1-ReAct和Tool Call实现.md`）：
-  1. `llmClient.chat(history, toolRegistry.getToolDefinitions())`
-  2. 若 `response.hasToolCalls()`：把 assistant 消息（含 tool_calls）+ 每个工具结果（`Message.tool(id, result)`）追加到 history，`continue`
-  3. 否则：追加 assistant 消息并返回 content
+  1. `llmClient.chat(history, toolRegistry.getToolDefinitions(), streamRenderer)` 流式调用
+  2. 若 `response.hasToolCalls()`：`streamRenderer.flushPending()` 刷出中间文本 → 把 assistant 消息（含 tool_calls）+ 每个工具结果（`Message.tool(id, result)`）追加到 history，`continue`
+  3. 否则：`streamRenderer.finish()` 收尾 → 打印 token 统计 → 追加 assistant 消息并返回
+- **第 4.1 期增强**：
+  - `StreamRenderer` 内部类：实现 `GLMClient.StreamListener`，三缓冲区设计（`pendingReasoning` 防空标题 + `lateReasoning` 收集延迟推理 + 双通道流式渲染）
+  - `flushPending()`：工具调用前刷出缓冲区中间文本，防止延迟显示
+  - `hasStreamedOutput()` → 流式输出后返回空字符串，避免重复
+  - SLF4J 日志埋点（工具调用、token 用量、异常）
 - 系统提示词硬编码在 `SYSTEM_PROMPT` 常量里，第 19 期会迁移到 `src/main/resources/prompts/` 分层架构
+- 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 5 节
 
-### 4.3 `llm.GLMClient` — LLM HTTP 客户端（第 1 期）
+### 4.3 `llm.GLMClient` — LLM HTTP 客户端（第 1 期基础，第 4.1 期增强）
 
 - 文件：`src/main/java/com/paicli/llm/GLMClient.java`
 - 端点：`https://open.bigmodel.cn/api/paas/v4/chat/completions`，模型 `glm-5.2`
-- OkHttp 超时：connect 60s / read 120s（LLM 生成慢，read 必须放宽）
+- OkHttp 超时：connect 60s / read 300s（流式 SSE 需要放宽）/ write 60s / call 600s
 - 内嵌 record 数据模型：
-  - `Message`（role + content + tool_calls + tool_call_id），提供 `system()` / `user()` / `assistant()` / `tool()` 静态工厂
+  - `Message`（role + content + tool_calls + tool_call_id + reasoningContent），提供 `system()` / `user()` / `assistant()` / `tool()` 静态工厂
   - `Tool`（name + description + parameters JSON Schema）
   - `ToolCall` / `Function`
-  - `ChatResponse`（content + toolCalls + inputTokens + outputTokens + `hasToolCalls()`）
+  - `ChatResponse`（content + reasoningContent + toolCalls + inputTokens + outputTokens + `hasToolCalls()`）
+  - `StreamListener`（流式回调接口，`NO_OP` 单例 + `onReasoningDelta` / `onContentDelta` 两个 default 方法）
+- **第 4.1 期增强**：
+  - `chatStream()`：SSE 逐行解析（`BufferedSource`），提取 `choices[0].delta.content` / `reasoning_content` / `tool_calls`，`[DONE]` 终止
+  - `buildRequestBody()`：抽取请求体构建，支持 `stream` 参数
+  - `mergeToolCallDeltas()` / `buildToolCalls()`：流式工具调用增量累加（`ToolCallAccumulator`）
+  - `chat(messages, tools)` 保持签名不变，内部委托到 `chatStream()`
 - 第 8 期会抽象出 `LlmClient` 接口与 `AbstractOpenAiCompatibleClient` 基类，届时 GLMClient 会瘦身为子类
+- 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 2 节
 
 ### 4.4 `tool.ToolRegistry` — 工具注册表（第 1 期基础，第 4 期增强）
 
@@ -184,7 +204,7 @@ paicli/
   - `executeTool(name, argumentsJson)` 用 Jackson 解析参数 → `Map<String,String>` → 调 executor
 - **已知限制**：参数值用 `asText()` 强转字符串，嵌套对象/数组会丢结构（当前工具都是字符串/数字参数，不受影响；扩展时需改这里）
 
-### 4.5 `agent.PlanExecuteAgent` — Plan-and-Execute 编排（第 2 期）
+### 4.5 `agent.PlanExecuteAgent` — Plan-and-Execute 编排（第 2 期基础，第 3/4.1 期增强）
 
 - 文件：`src/main/java/com/paicli/agent/PlanExecuteAgent.java`
 - 职责：计划执行编排 + HITL 审查流程
@@ -202,11 +222,17 @@ paicli/
     - 消息历史在 Task 内维护，跨 Task 通过 `buildTaskContext()` 传递依赖结果
     - 工具结果回灌到消息历史，LLM 可基于结果决定下一步操作
   - **失败恢复**：失败 + 进度 < 50% 时触发 `Planner.replan()`
-- 内部类型：`TaskExecutionResult`（封装成功/失败结果）、`PlanReviewHandler`（审查回调接口）、`PlanReviewAction`（EXECUTE/SUPPLEMENT/CANCEL）、`PlanReviewDecision`（决策 + 补充说明）
+- 内部类型：`TaskExecutionResult`（封装成功/失败/流式输出结果）、`TaskRunResult`（流式标记传递）、`PlanReviewHandler`（审查回调接口）、`PlanReviewAction`（EXECUTE/SUPPLEMENT/CANCEL）、`PlanReviewDecision`（决策 + 补充说明）、`StreamState`（跨任务流式输出标记）、`TaskStreamRenderer`（任务级流式渲染器）
 - **第 3 期增强**（Memory 联动）：共享会话上下文、轮开始前压缩、上下文感知规划、事实提取、Token 统计完善
-- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 15 节 + `docs/chapter3-Memory实现.md`
+- **第 4.1 期增强**（流式输出 + 日志）：
+  - `TaskStreamRenderer`：任务级流式渲染器（`synchronized` 线程安全 + taskId 标签 + `flushPending` 中间刷出）
+  - `StreamState`：`volatile` 跨任务流式标记共享
+  - `TaskRunResult`：流式标记从 `executeTask` → `executePlan` → `buildFinalResult` 的传递链
+  - 已流式输出的任务在 `buildFinalResult` 和完成打印中跳过，避免重复
+  - SLF4J 日志埋点（plan 开始/完成、task 执行/完成/失败、工具调用）
+- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 15 节 + `docs/chapter3-Memory实现.md` + `docs/chapter4.1-Streaming_and_Log实现.md` 第 6 节
 
-### 4.6 `plan.Planner` — LLM 任务分解（第 2 期）
+### 4.6 `plan.Planner` — LLM 任务分解（第 2 期基础，第 3/4.1 期增强）
 
 - 文件：`src/main/java/com/pacicli/plan/Planner.java`
 - 职责：用 `PLANNING_PROMPT` 让 LLM 输出 `{summary, tasks:[{id,description,type,dependencies}]}` JSON
@@ -217,7 +243,11 @@ paicli/
   4. 调 `ExecutionPlan.computeExecutionOrder()` 做拓扑排序，有环抛异常
 - `replan(failedPlan, reason)`：把已完成任务列表和失败原因作为上下文重新调 `createPlan()`
 - **第 3 期增强**：新增 `createPlan(String goal, String priorContext)` 重载——当 `priorContext` 非空时，把先前对话上下文拼入 user 消息
-- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 3、15 节
+- **第 4.1 期增强**（流式规划 + 简单目标优化）：
+  - `PlanningStreamRenderer`：流式渲染规划阶段的 LLM 推理过程（仅 reasoning 通道）
+  - `isSimpleGoal()` / `createMinimalPlan()`：简单任务跳过 LLM 规划，直接生成单任务计划（长度 ≤ 30 且含简单操作词）
+  - `PLANNING_PROMPT` 优化：新增规则 5-8（允许 1-3 任务、禁止无意义的中间文件读写、鼓励最短计划）
+- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 3、15 节 + `docs/chapter4.1-Streaming_and_Log实现.md` 第 7 节
 
 ### 4.7 `plan.ExecutionPlan` — 计划 DAG（第 2 期）
 
@@ -293,6 +323,26 @@ paicli/
   - **无参 `/search` 三层兜底**：已索引 → 显示统计+示例；未索引 → 提示 `/index`；异常 → 降级提示
 - **依赖**：sqlite-jdbc 3.49、javaparser-core 3.28、jieba-analysis 1.0.2
 - 详见 `docs/chapter4-RAG开发.md`
+
+### 4.11 `util` 包 — 工具类（第 4.1 期新增）
+
+- 文件：`src/main/java/com/paicli/util/AnsiStyle.java`、`src/main/java/com/paicli/util/TerminalMarkdownRenderer.java`（`JiebaSegmenterFactory.java` 为第 4 期已有）
+- **`AnsiStyle`**：终端 ANSI 样式辅助类，提供 `heading()`（粗体青色）、`section()`（粗体绿色）、`subtle()`（暗色灰色）、`codeLabel()`（粗体黄色）、`quotePrefix()`（暗色青色）、`emphasis()`（粗体）等静态方法；通过 `NO_COLOR` 环境变量或 `TERM=dumb` 自动禁用颜色
+- **`TerminalMarkdownRenderer`**：轻量终端 Markdown 流式渲染器，支持标题（H1-H6）、有序/无序列表、引用、代码块（`┌─` / `└─` 包裹）、表格（ASCII 或 key-value 两种模式）、行内格式（粗体/斜体/代码/链接→纯文本去除标记）
+  - 核心方法：`append(chunk)` 流式追加 → `flushCompleteLines()` 按行刷出 → `flushPending()` 强制刷出残留文本 → `finish()` 收尾关闭代码块
+- 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 3-4 节
+
+### 4.12 `resources/logback.xml` — 日志配置（第 4.1 期新增）
+
+- 文件：`src/main/resources/logback.xml`
+- 配置：`RollingFileAppender` + `SizeAndTimeBasedRollingPolicy`
+  - 日志文件：`~/.paicli/logs/paicli.log`
+  - 滚动策略：按天 + 按大小（`maxFileSize`）双重触发
+  - 归档压缩：`.gz` 存储
+  - 自动清理：`maxHistory`（最大保留天数）+ `totalSizeCap`（总容量上限）+ `cleanHistoryOnStart`
+- 日志级别通过 `paicli.log.level` 系统属性 / `PAICLI_LOG_LEVEL` 环境变量 / `.env` 三层回退配置（默认 `INFO`）
+- 注意：`pom.xml` 中已删除 `slf4j-simple`，确保 logback 为唯一 SLF4J binding
+- 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 8 节
 
 ---
 

@@ -1,6 +1,7 @@
 package com.paicli.memory;
 
 import com.huaban.analysis.jieba.JiebaSegmenter;
+import com.paicli.util.JiebaSegmenterFactory;
 
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -12,9 +13,10 @@ import java.util.Set;
  *
  * 使用 jieba 进行中文分词，英文保留完整单词。
  * 过滤掉单字和纯标点，保留有意义的词语用于关键词匹配。
+ * 应用于长期记忆中的相关内容检索
  */
 final class MemoryQueryTokenizer {
-    private static final JiebaSegmenter SEGMENTER = new JiebaSegmenter();
+    private static final JiebaSegmenter SEGMENTER =JiebaSegmenterFactory.createSilently();
 
     private MemoryQueryTokenizer() {
     }

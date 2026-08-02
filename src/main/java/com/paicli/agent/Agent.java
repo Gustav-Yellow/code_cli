@@ -3,6 +3,10 @@ package com.paicli.agent;
 import com.paicli.llm.GLMClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.tool.ToolRegistry;
+import com.paicli.util.AnsiStyle;
+import com.paicli.util.TerminalMarkdownRenderer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -10,6 +14,7 @@ import java.util.List;
 
 public class Agent {
 
+    private static final Logger log = LoggerFactory.getLogger(Agent.class);
     private final GLMClient llmClient;
     private final ToolRegistry toolRegistry;
     private final List<GLMClient.Message> conversationHistory;
@@ -64,6 +69,7 @@ public class Agent {
      * 运行 Agent 循环
      */
     public String run(String userInput) {
+        log.info("ReAct run started: inputLength={}", userInput == null ? 0 : userInput.length());
         // 先检索相关长期记忆并注入 system prompt（检索在写入历史之前，避免自匹配）
         String memoryContext = memoryManager.buildContextForQuery(userInput, 500);
         updateSystemPromptWithMemory(memoryContext);
@@ -76,6 +82,8 @@ public class Agent {
         // 推理记录上下文，对应每轮对话
         StringBuilder reasoningTranscript = new StringBuilder();
 
+        StreamRenderer streamRenderer = new StreamRenderer();
+
         int iteration = 0;
         while (iteration < MAX_ITERATIONS) {
             iteration++;
@@ -87,7 +95,8 @@ public class Agent {
                 // 调用 LLM
                 GLMClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
-                        toolRegistry.getToolDefinitions()
+                        toolRegistry.getToolDefinitions(),
+                        streamRenderer
                 );
 
                 // 记录本次调用的 token 使用（覆盖工具调用与最终响应两条分支）
@@ -96,6 +105,7 @@ public class Agent {
                 // 如果有工具调用
                 if (response.hasToolCalls()) {
                     appendReasoning(reasoningTranscript, response.reasoningContent());
+                    log.info("LLM requested {} tool call(s) in iteration {}", response.toolCalls().size(), iteration);
                     // 添加助手消息（包含工具调用）
                     conversationHistory.add(GLMClient.Message.assistant(
                             response.reasoningContent(),
@@ -103,16 +113,26 @@ public class Agent {
                             response.toolCalls()
                     ));
 
+                    // 刷出缓冲区中的中间文本，确保在工具调用日志之前可见
+                    streamRenderer.flushPending();
+
                     // 执行每个工具调用
                     for (GLMClient.ToolCall toolCall : response.toolCalls()) {
+                        log.info("Executing tool: {} (iteration={})", toolCall.function().name(), iteration);
+                        log.debug("Tool args [{}]: {}", toolCall.function().name(), toolCall.function().arguments());
                         String toolName = toolCall.function().name();
                         String toolArgs = toolCall.function().arguments();
+
+
+
 
                         System.out.println("🔧 执行工具: " + toolName);
                         System.out.println("   参数: " + toolArgs);
 
                         // 执行工具
                         String toolResult = toolRegistry.executeTool(toolName, toolArgs);
+                        log.debug("Tool result preview [{}]: {}", toolCall.function().name(),
+                                preview(toolResult, 300));
 
                         System.out.println("   结果: " + toolResult.substring(0, Math.min(200, toolResult.length()))
                                 + (toolResult.length() > 200 ? "..." : "") + "\n");
@@ -132,18 +152,39 @@ public class Agent {
                             response.content()
                     ));
 
+                    // 先刷出缓冲区残留文本，确保在 token 统计之前全部可见
+                    boolean wasStreamed = streamRenderer.hasStreamedOutput();
+                    if (wasStreamed) {
+                        streamRenderer.finish();
+                    }
+
                     // 打印 token 使用情况
                     System.out.printf("📊 Token使用: 输入=%d, 输出=%d%n\n",
                             response.inputTokens(), response.outputTokens());
+
+                    log.info("ReAct run finished: inputTokens={}, outputTokens={}, reasoningChars={}, answerChars={}",
+                            response.inputTokens(),
+                            response.outputTokens(),
+                            response.reasoningContent() == null ? 0 : response.reasoningContent().length(),
+                            response.content() == null ? 0 : response.content().length());
+                    if (log.isDebugEnabled()) {
+                        log.debug("Assistant answer preview: {}", preview(response.content(), 500));
+                    }
+
+                    if (wasStreamed) {
+                        return "";
+                    }
 
                     return formatUserFacingResponse(reasoningTranscript.toString(), response.content());
                 }
 
             } catch (IOException e) {
+                log.error("LLM call failed in ReAct loop", e);
                 return "❌ 调用 LLM 失败: " + e.getMessage();
             }
         }
 
+        log.warn("ReAct run reached max iterations: {}", MAX_ITERATIONS);
         return "❌ 达到最大迭代次数限制，任务未完成";
     }
 
@@ -232,5 +273,133 @@ public class Agent {
 
         // 都不为空的情况下 返回推理内容和回答内容
         return "🧠 思考过程:\n" + normalizedReasoning + "\n\n🤖 最终结果:\n" + normalizedAnswer;
+    }
+
+    private String preview(String content, int maxLength) {
+        if (content == null) {
+            return "";
+        }
+        String normalized = content.replace("\r\n", "\n").replace('\r', '\n');
+        if (normalized.length() <= maxLength) {
+            return normalized;
+        }
+        return normalized.substring(0, maxLength) + "...";
+    }
+
+    /**
+     * 流式输出渲染器，将 reasoning_content 与 content 分区展示。
+     *
+     * 服务器可能把 reasoning_content 切成多段下发，甚至在 content 开始之后追加 reasoning；
+     * 终端是线性的，无法回头修改已写出的文字。渲染策略：
+     *
+     * 1. 在 content 出现之前，只要 reasoning 有实质内容（非空白），就立刻流式打印在"🧠 思考过程"下
+     * 2. 仅空白的 reasoning delta 会先暂存，不触发标题——避免出现"空的思考过程"
+     * 3. content 一出现就收尾 reasoning 区，打印"🤖 最终结果"标题并流式输出 content
+     * 4. 如果 content 启动之后又收到 reasoning（服务器把思考内容追加在答案之后），
+     *    缓冲到 lateReasoning，最终在 finish() 用"🧠 补充思考"标题独立展示，不会污染最终结果区
+     */
+    private static final class StreamRenderer implements GLMClient.StreamListener {
+        private final StringBuilder pendingReasoning = new StringBuilder();
+        private final StringBuilder lateReasoning = new StringBuilder();
+        private TerminalMarkdownRenderer reasoningRenderer;
+        private TerminalMarkdownRenderer contentRenderer;
+        private boolean reasoningStarted;
+        private boolean contentStarted;
+        private boolean streamedOutput;
+
+        @Override
+        public void onReasoningDelta(String delta) {
+            if (delta == null || delta.isEmpty()) {
+                return;
+            }
+            if (contentStarted) {
+                // content 已开始，无法回头；缓冲到"补充思考"
+                lateReasoning.append(delta);
+                return;
+            }
+            if (!reasoningStarted) {
+                pendingReasoning.append(delta);
+                if (pendingReasoning.toString().isBlank()) {
+                    return;  // 还没攒出实质内容，等
+                }
+                System.out.println(AnsiStyle.heading("🧠 思考过程"));
+                reasoningRenderer = new TerminalMarkdownRenderer(System.out);
+                reasoningRenderer.append(pendingReasoning.toString());
+                pendingReasoning.setLength(0);
+                reasoningStarted = true;
+                streamedOutput = true;
+            } else {
+                reasoningRenderer.append(delta);
+            }
+            System.out.flush();
+        }
+
+        @Override
+        public void onContentDelta(String delta) {
+            if (delta == null || delta.isEmpty()) {
+                return;
+            }
+            if (!contentStarted) {
+                if (reasoningStarted && reasoningRenderer != null) {
+                    reasoningRenderer.finish();
+                    System.out.println();
+                } else if (pendingReasoning.length() > 0 && !pendingReasoning.toString().isBlank()) {
+                    // 有实质 reasoning 但之前没攒够阈值就被 content 打断：先补打思考过程
+                    System.out.println(AnsiStyle.heading("🧠 思考过程"));
+                    TerminalMarkdownRenderer r = new TerminalMarkdownRenderer(System.out);
+                    r.append(pendingReasoning.toString());
+                    r.finish();
+                    System.out.println();
+                    pendingReasoning.setLength(0);
+                    reasoningStarted = true;
+                }
+                System.out.println(AnsiStyle.section("🤖 最终结果"));
+                contentRenderer = new TerminalMarkdownRenderer(System.out);
+                contentStarted = true;
+                streamedOutput = true;
+            }
+            contentRenderer.append(delta);
+            System.out.flush();
+        }
+
+        private boolean hasStreamedOutput() {
+            return streamedOutput;
+        }
+
+        private void finish() {
+            if (reasoningRenderer != null) {
+                reasoningRenderer.finish();
+            }
+            if (contentRenderer != null) {
+                contentRenderer.finish();
+            }
+            String late = lateReasoning.toString().trim();
+            if (!late.isEmpty()) {
+                System.out.println();
+                System.out.println(AnsiStyle.heading("🧠 补充思考"));
+                TerminalMarkdownRenderer r = new TerminalMarkdownRenderer(System.out);
+                r.append(late);
+                r.finish();
+                lateReasoning.setLength(0);
+                streamedOutput = true;
+            }
+            if (streamedOutput) {
+                System.out.println();
+            }
+        }
+
+        /**
+         * 刷出缓冲区中尚未以换行结尾的残留内容。
+         * 用于工具调用前确保中间文本可见，不关闭渲染器。
+         */
+        private void flushPending() {
+            if (reasoningRenderer != null) {
+                reasoningRenderer.flushPending();
+            }
+            if (contentRenderer != null) {
+                contentRenderer.flushPending();
+            }
+            System.out.flush();
+        }
     }
 }

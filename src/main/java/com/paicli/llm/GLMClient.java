@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import okhttp3.*;
+import okio.BufferedSource;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -23,8 +24,9 @@ public class GLMClient {
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final OkHttpClient SHARED_HTTP_CLIENT = new OkHttpClient.Builder()
             .connectTimeout(60, TimeUnit.SECONDS)
-            .readTimeout(120, TimeUnit.SECONDS)
+            .readTimeout(300, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
+            .callTimeout(600, TimeUnit.SECONDS)
             .build();
     private final String apiKey;
 
@@ -43,60 +45,180 @@ public class GLMClient {
      * @return 模型响应，封装了角色、文本内容、工具调用及 token 用量
      * @throws IOException 当网络请求失败或 HTTP 状态码非 2xx 时抛出
      */
+    /**
+     * {
+     *   "model": "glm-5.2",
+     *   "messages": [
+     *     {
+     *       "role": "system",
+     *       "content": "你是一个终端编码助手。"
+     *     },
+     *     {
+     *       "role": "user",
+     *       "content": "列出当前目录的 Java 文件"
+     *     },
+     *     {
+     *       "role": "assistant",
+     *       "content": "我来帮你查看。",
+     *       "tool_calls": [
+     *         {
+     *           "id": "call_abc123",
+     *           "type": "function",
+     *           "function": {
+     *             "name": "list_files",
+     *             "arguments": "{\"directory\":\".\",\"extension\":\".java\"}"
+     *           }
+     *         }
+     *       ]
+     *     },
+     *     {
+     *       "role": "tool",
+     *       "content": "GLMClient.java\nPaicliApplication.java",
+     *       "tool_call_id": "call_abc123"
+     *     }
+     *   ],
+     *   "tools": [
+     *     {
+     *       "type": "function",
+     *       "function": {
+     *         "name": "list_files",
+     *         "description": "列出指定目录下的文件",
+     *         "parameters": {
+     *           "type": "object",
+     *           "properties": {
+     *             "directory": { "type": "string" },
+     *             "extension": { "type": "string" }
+     *           },
+     *           "required": ["directory"]
+     *         }
+     *       }
+     *     }
+     *   ]
+     * }
+     */
     public ChatResponse chat(List<Message> messages, List<Tool> tools) throws IOException {
-        /**
-         * {
-         *   "model": "glm-5.2",
-         *   "messages": [
-         *     {
-         *       "role": "system",
-         *       "content": "你是一个终端编码助手。"
-         *     },
-         *     {
-         *       "role": "user",
-         *       "content": "列出当前目录的 Java 文件"
-         *     },
-         *     {
-         *       "role": "assistant",
-         *       "content": "我来帮你查看。",
-         *       "tool_calls": [
-         *         {
-         *           "id": "call_abc123",
-         *           "type": "function",
-         *           "function": {
-         *             "name": "list_files",
-         *             "arguments": "{\"directory\":\".\",\"extension\":\".java\"}"
-         *           }
-         *         }
-         *       ]
-         *     },
-         *     {
-         *       "role": "tool",
-         *       "content": "GLMClient.java\nPaicliApplication.java",
-         *       "tool_call_id": "call_abc123"
-         *     }
-         *   ],
-         *   "tools": [
-         *     {
-         *       "type": "function",
-         *       "function": {
-         *         "name": "list_files",
-         *         "description": "列出指定目录下的文件",
-         *         "parameters": {
-         *           "type": "object",
-         *           "properties": {
-         *             "directory": { "type": "string" },
-         *             "extension": { "type": "string" }
-         *           },
-         *           "required": ["directory"]
-         *         }
-         *       }
-         *     }
-         *   ]
-         * }
-         */
+        return chat(messages, tools, StreamListener.NO_OP);
+    }
+
+    public ChatResponse chat(List<Message> messages, List<Tool> tools, StreamListener streamListener) throws IOException {
+        return chatStream(messages, tools, streamListener);
+    }
+
+    /**
+     * 流式聊天请求。会通过 listener 持续返回 reasoning/content 增量，
+     * 同时在结束后汇总为完整的 ChatResponse。
+     */
+    public ChatResponse chatStream(List<Message> messages, List<Tool> tools, StreamListener listener) throws IOException {
+        StreamListener streamListener = listener == null ? StreamListener.NO_OP : listener;
+
+        RequestBody body = RequestBody.create(
+                buildRequestBody(messages, tools, true).toString(),
+                MediaType.parse("application/json")
+        );
+
+        Request request = new Request.Builder()
+                .url(API_URL)
+                .header("Authorization", "Bearer " + apiKey)
+                .header("Content-Type", "application/json")
+                .post(body)
+                .build();
+
+        try (Response response = SHARED_HTTP_CLIENT.newCall(request).execute()) {
+            ResponseBody responseBodyObj = response.body();
+            if (!response.isSuccessful()) {
+                String errorBody = responseBodyObj != null ? responseBodyObj.string() : "无响应体";
+                throw new IOException("API请求失败: " + response.code() + " - " + errorBody);
+            }
+            if (responseBodyObj == null) {
+                throw new IOException("API返回空响应体");
+            }
+
+            BufferedSource source = responseBodyObj.source();
+            String role = "assistant";
+            StringBuilder content = new StringBuilder();
+            StringBuilder reasoning = new StringBuilder();
+            List<ToolCallAccumulator> toolAccumulators = new ArrayList<>();
+            int inputTokens = 0;
+            int outputTokens = 0;
+
+            while (!source.exhausted()) {
+                String line = source.readUtf8Line();
+                if (line == null) {
+                    break;
+                }
+
+                String trimmed = line.trim();
+                if (trimmed.isEmpty() || !trimmed.startsWith("data:")) {
+                    continue;
+                }
+
+                String payload = trimmed.substring("data:".length()).trim();
+                if (payload.isEmpty()) {
+                    continue;
+                }
+                if ("[DONE]".equals(payload)) {
+                    break;
+                }
+
+                JsonNode root = mapper.readTree(payload);
+                JsonNode usage = root.path("usage");
+                if (!usage.isMissingNode()) {
+                    inputTokens = usage.path("prompt_tokens").asInt(inputTokens);
+                    outputTokens = usage.path("completion_tokens").asInt(outputTokens);
+                }
+
+                JsonNode choices = root.path("choices");
+                if (!choices.isArray() || choices.isEmpty()) {
+                    continue;
+                }
+
+                JsonNode choice = choices.get(0);
+                JsonNode delta = choice.path("delta");
+                if (delta.isMissingNode() || delta.isNull()) {
+                    delta = choice.path("message");
+                }
+                if (delta.isMissingNode() || delta.isNull()) {
+                    continue;
+                }
+
+                String deltaRole = delta.path("role").asText();
+                if (!deltaRole.isEmpty()) {
+                    role = deltaRole;
+                }
+
+                String reasoningDelta = delta.path("reasoning_content").asText();
+                if (!reasoningDelta.isEmpty()) {
+                    reasoning.append(reasoningDelta);
+                    streamListener.onReasoningDelta(reasoningDelta);
+                }
+
+                String contentDelta = delta.path("content").asText();
+                if (!contentDelta.isEmpty()) {
+                    content.append(contentDelta);
+                    streamListener.onContentDelta(contentDelta);
+                }
+
+                mergeToolCallDeltas(toolAccumulators, delta.path("tool_calls"));
+            }
+
+            return new ChatResponse(
+                    role,
+                    content.toString(),
+                    reasoning.toString(),
+                    buildToolCalls(toolAccumulators),
+                    inputTokens,
+                    outputTokens
+            );
+        }
+    }
+
+    private ObjectNode buildRequestBody(List<Message> messages, List<Tool> tools, boolean stream) {
         ObjectNode requestBody = mapper.createObjectNode();
         requestBody.put("model", MODEL);
+
+        if (stream) {
+            requestBody.put("stream", true);
+        }
 
         // 添加消息
         ArrayNode messagesArray = requestBody.putArray("messages");
@@ -185,97 +307,54 @@ public class GLMClient {
             }
         }
 
-        RequestBody body = RequestBody.create(
-                requestBody.toString(),
-                MediaType.parse("application/json")
-        );
+        return requestBody;
+    }
 
-        // HTTP 请求封装
-        /**
-         * 方法：POST
-         * URL：https://open.bigmodel.cn/api/paas/v4/chat/completions
-         * Headers：
-         * Authorization: Bearer <apiKey>
-         * Content-Type: application/json
-         * Body：上面 JSON 的字符串形式（第 99 行 requestBody.toString()）
-         */
-        Request request = new Request.Builder()
-                .url(API_URL)
-                .header("Authorization", "Bearer " + apiKey)
-                .header("Content-Type", "application/json")
-                .post(body)
-                .build();
-
-        // 执行请求，并且获取响应的结果
-        // 响应的 Json 结构
-        /**
-         * {
-         *   "choices": [
-         *     {
-         *       "message": {
-         *         "role": "assistant",
-         *         "content": "...",
-         *         "tool_calls": [
-         *           {
-         *             "id": "...",
-         *             "function": {
-         *               "name": "...",
-         *               "arguments": "..."
-         *             }
-         *           }
-         *         ]
-         *       }
-         *     }
-         *   ],
-         *   "usage": {
-         *     "prompt_tokens": 123,
-         *     "completion_tokens": 45
-         *   }
-         * }
-         */
-        try (Response response = SHARED_HTTP_CLIENT.newCall(request).execute()) {
-            ResponseBody responseBodyObj = response.body();
-            if (!response.isSuccessful()) {
-                String errorBody = responseBodyObj != null ? responseBodyObj.string() : "无响应体";
-                throw new IOException("API请求失败: " + response.code() + " - " + errorBody);
-            }
-            if (responseBodyObj == null) {
-                throw new IOException("API返回空响应体");
-            }
-
-            String responseBody = responseBodyObj.string();
-            JsonNode root = mapper.readTree(responseBody);
-
-            // 解析响应
-            JsonNode choice = root.path("choices").get(0);
-            JsonNode message = choice.path("message");
-
-            String role = message.path("role").asText();
-            String content = message.path("content").asText();
-            String reasoningContent = message.path("reasoning_content").asText();
-
-            // 解析工具调用
-            List<ToolCall> toolCalls = null;
-            if (message.has("tool_calls") && message.path("tool_calls").isArray()) {
-                toolCalls = new ArrayList<>();
-                for (JsonNode tc : message.path("tool_calls")) {
-                    toolCalls.add(new ToolCall(
-                            tc.path("id").asText(),
-                            new ToolCall.Function(
-                                    tc.path("function").path("name").asText(),
-                                    tc.path("function").path("arguments").asText()
-                            )
-                    ));
-                }
-            }
-
-            // 解析token使用
-            JsonNode usage = root.path("usage");
-            int inputTokens = usage.path("prompt_tokens").asInt();
-            int outputTokens = usage.path("completion_tokens").asInt();
-
-            return new ChatResponse(role, content, reasoningContent, toolCalls, inputTokens, outputTokens);
+    private void mergeToolCallDeltas(List<ToolCallAccumulator> accumulators, JsonNode toolCallsNode) {
+        if (toolCallsNode == null || !toolCallsNode.isArray()) {
+            return;
         }
+
+        for (JsonNode tc : toolCallsNode) {
+            int index = tc.path("index").asInt(accumulators.size());
+            while (accumulators.size() <= index) {
+                accumulators.add(new ToolCallAccumulator());
+            }
+
+            ToolCallAccumulator acc = accumulators.get(index);
+            String id = tc.path("id").asText();
+            if (!id.isEmpty()) {
+                acc.id = id;
+            }
+
+            JsonNode function = tc.path("function");
+            String name = function.path("name").asText();
+            if (!name.isEmpty()) {
+                acc.name.append(name);
+            }
+            String arguments = function.path("arguments").asText();
+            if (!arguments.isEmpty()) {
+                acc.arguments.append(arguments);
+            }
+        }
+    }
+
+    private List<ToolCall> buildToolCalls(List<ToolCallAccumulator> accumulators) {
+        if (accumulators.isEmpty()) {
+            return null;
+        }
+
+        List<ToolCall> toolCalls = new ArrayList<>();
+        for (ToolCallAccumulator acc : accumulators) {
+            if (acc.id == null || acc.id.isBlank()) {
+                continue;
+            }
+            toolCalls.add(new ToolCall(
+                    acc.id,
+                    new ToolCall.Function(acc.name.toString(), acc.arguments.toString())
+            ));
+        }
+        return toolCalls.isEmpty() ? null : toolCalls;
     }
 
     /**
@@ -368,13 +447,18 @@ public class GLMClient {
     public record Tool(String name, String description, JsonNode parameters) {}
 
     /**
+     * 推理流监听器，用于监听推理流中的 delta 消息
+     */
+    public interface StreamListener {
+        StreamListener NO_OP = new StreamListener() {};
+
+        default void onReasoningDelta(String delta) {}
+
+        default void onContentDelta(String delta) {}
+    }
+
+    /**
      * 模型响应记录，封装一次 chat 请求的返回结果
-     *
-     * @param role         消息角色，通常为 assistant
-     * @param content      模型输出的文本内容
-     * @param toolCalls    模型触发的工具调用列表，无调用时为 null
-     * @param inputTokens  输入 token 用量（prompt_tokens）
-     * @param outputTokens 输出 token 用量（completion_tokens）
      */
     public record ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
                                int inputTokens, int outputTokens) {
@@ -388,6 +472,15 @@ public class GLMClient {
         public boolean hasToolCalls() {
             return toolCalls != null && !toolCalls.isEmpty();
         }
+    }
+
+    /**
+     * 工具调用累加器，用于收集工具调用中的内容
+     */
+    private static final class ToolCallAccumulator {
+        private String id;
+        private final StringBuilder name = new StringBuilder();
+        private final StringBuilder arguments = new StringBuilder();
     }
 
 }
