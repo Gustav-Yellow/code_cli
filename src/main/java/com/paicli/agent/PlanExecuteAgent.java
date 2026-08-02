@@ -498,11 +498,21 @@ public class PlanExecuteAgent {
                     return toolOnlyResult;
                 }
 
-                return response.content();
+                // 组装推理内容与回复
+                String reasoning = response.reasoningContent();
+                String answer = response.content();
+                if (reasoning != null && !reasoning.isBlank()) {
+                    return "🧠 思考过程:\n" + reasoning.trim() + "\n\n🤖 执行结果:\n" + (answer != null ? answer.trim() : "");
+                }
+                return answer;
             }
 
             // 有工具调用：执行工具并将结果回灌到消息历史
-            messages.add(GLMClient.Message.assistant(response.content(), response.toolCalls()));
+            messages.add(GLMClient.Message.assistant(
+                    response.reasoningContent(),
+                    response.content(),
+                    response.toolCalls()
+            ));
 
             for (GLMClient.ToolCall toolCall : response.toolCalls()) {
                 String toolName = toolCall.function().name();

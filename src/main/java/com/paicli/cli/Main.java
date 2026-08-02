@@ -159,7 +159,10 @@ public class Main {
                     }
                     case MEMORY_SAVE -> {
                         String fact = command.payload();
-                        if (fact != null && !fact.isEmpty()) {
+                        // 如果 /save 后没有内容，则打印提示
+                        if (fact == null || fact.isEmpty()) {
+                            System.out.println("❌ 请提供要保存的内容，例如 /save 这个项目使用Java 17\n");
+                        } else {
                             reactAgent.getMemoryManager().storeFact(fact);
                             System.out.println("💾 已保存到长期记忆: " + fact + "\n");
                         }
@@ -700,7 +703,7 @@ public class Main {
      *   <li>OS 环境变量（已在 System.getenv 中，无需 setProperty）</li>
      * </ol>
      *
-     * <p>这样 {@link com.paicli.rag.EmbeddingClient#getEnv} 的
+     * <p>这样 {@link com.paicli.rag.EmbeddingClient#getEnv(String, String)} 的
      * {@code System.getProperty(key)} 回退路径就能命中 .env 中的
      * {@code EMBEDDING_PROVIDER} / {@code EMBEDDING_MODEL} / {@code EMBEDDING_API_KEY}
      * 等配置，不再需要把这些变量 export 到真正的 OS 环境变量中。</p>

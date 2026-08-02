@@ -73,6 +73,9 @@ public class Agent {
 
         System.out.println("🤔 思考中...\n");
 
+        // 推理记录上下文，对应每轮对话
+        StringBuilder reasoningTranscript = new StringBuilder();
+
         int iteration = 0;
         while (iteration < MAX_ITERATIONS) {
             iteration++;
@@ -92,8 +95,10 @@ public class Agent {
 
                 // 如果有工具调用
                 if (response.hasToolCalls()) {
+                    appendReasoning(reasoningTranscript, response.reasoningContent());
                     // 添加助手消息（包含工具调用）
                     conversationHistory.add(GLMClient.Message.assistant(
+                            response.reasoningContent(),
                             response.content(),
                             response.toolCalls()
                     ));
@@ -121,13 +126,17 @@ public class Agent {
 
                 } else {
                     // 没有工具调用，直接返回结果
-                    conversationHistory.add(GLMClient.Message.assistant(response.content()));
+                    appendReasoning(reasoningTranscript, response.reasoningContent());
+                    conversationHistory.add(GLMClient.Message.assistant(
+                            response.reasoningContent(),
+                            response.content()
+                    ));
 
                     // 打印 token 使用情况
                     System.out.printf("📊 Token使用: 输入=%d, 输出=%d%n\n",
                             response.inputTokens(), response.outputTokens());
 
-                    return response.content();
+                    return formatUserFacingResponse(reasoningTranscript.toString(), response.content());
                 }
 
             } catch (IOException e) {
@@ -182,5 +191,46 @@ public class Agent {
      */
     public ToolRegistry getToolRegistry() {
         return toolRegistry;
+    }
+
+    /**
+     * 追加推理内容到推理记录中
+     * @param reasoningTranscript 推理记录
+     * @param reasoningContent 推理内容
+     */
+    private void appendReasoning(StringBuilder reasoningTranscript, String reasoningContent) {
+        if (reasoningContent == null || reasoningContent.isBlank()) {
+            return;
+        }
+
+        if (!reasoningTranscript.isEmpty()) {
+            reasoningTranscript.append("\n\n");
+        }
+        reasoningTranscript.append(reasoningContent);
+    }
+
+    /**
+     * 格式化用户可见的响应内容
+     * @param reasoningContent 推理内容
+     * @param answer 回答内容
+     * @return 格式化后的响应内容
+     */
+    private String formatUserFacingResponse(String reasoningContent, String answer) {
+        // 获取推理内容和回答内容的非空版本
+        String normalizedReasoning = reasoningContent == null ? "" : reasoningContent.trim();
+        String normalizedAnswer = answer == null ? "" : answer.trim();
+
+        // 如果推理内容为空，则直接返回答案内容
+        if (normalizedReasoning.isEmpty()) {
+            return normalizedAnswer;
+        }
+
+        // 如果回答内容为空，则返回推理内容
+        if (normalizedAnswer.isEmpty()) {
+            return "🧠思考过程:\n" + normalizedReasoning;
+        }
+
+        // 都不为空的情况下 返回推理内容和回答内容
+        return "🧠 思考过程:\n" + normalizedReasoning + "\n\n🤖 最终结果:\n" + normalizedAnswer;
     }
 }

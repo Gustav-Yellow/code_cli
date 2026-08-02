@@ -105,6 +105,9 @@ public class GLMClient {
             ObjectNode msgNode = messagesArray.addObject();
             msgNode.put("role", msg.role());
             msgNode.put("content", msg.content());
+            if (msg.reasoningContent() != null && !msg.reasoningContent().isBlank()) {
+                msgNode.put("reasoning_content", msg.reasoningContent());
+            }
 
             // 添加工具调用信息
             // 仅当角色为 assistant 发起工具调用时（且 msg.toolCalls 不为空）
@@ -249,6 +252,7 @@ public class GLMClient {
 
             String role = message.path("role").asText();
             String content = message.path("content").asText();
+            String reasoningContent = message.path("reasoning_content").asText();
 
             // 解析工具调用
             List<ToolCall> toolCalls = null;
@@ -270,7 +274,7 @@ public class GLMClient {
             int inputTokens = usage.path("prompt_tokens").asInt();
             int outputTokens = usage.path("completion_tokens").asInt();
 
-            return new ChatResponse(role, content, toolCalls, inputTokens, outputTokens);
+            return new ChatResponse(role, content, reasoningContent, toolCalls, inputTokens, outputTokens);
         }
     }
 
@@ -283,12 +287,12 @@ public class GLMClient {
      * @param toolCallId  工具调用结果对应的调用 ID（仅 tool 角色使用，用于回传结果）
      */
     // 记录定义
-    public record Message(String role, String content, List<ToolCall> toolCalls, String toolCallId) {
+    public record Message(String role, String content, String reasoningContent, List<ToolCall> toolCalls, String toolCallId) {
         /**
          * 简化构造：仅包含角色与内容，不携带工具调用信息
          */
         public Message(String role, String content) {
-            this(role, content, null, null);
+            this(role, content, null, null, null);
         }
 
         /** 创建 system 角色消息（设定模型行为/人设） */
@@ -306,14 +310,35 @@ public class GLMClient {
             return new Message("assistant", content);
         }
 
+        /**
+         * 创建 assistant 角色消息（模型纯文本回复）
+         * @param reasoningContent 推理内容
+         * @param content 内容
+         * @return 消息
+         */
+        public static Message assistant(String reasoningContent, String content) {
+            return new Message("assistant", content, reasoningContent, null, null);
+        }
+
         /** 创建 assistant 角色消息（模型发起工具调用时使用，可同时携带文本与工具调用） */
         public static Message assistant(String content, List<ToolCall> toolCalls) {
-            return new Message("assistant", content, toolCalls, null);
+            return new Message("assistant", content, null, toolCalls, null);
+        }
+
+        /**
+         * 创建 assistant 角色消息（模型发起工具调用时使用，可同时携带文本与工具调用）
+         * @param reasoningContent 推理内容
+         * @param content 内容
+         * @param toolCalls 工具调用
+         * @return 消息
+         */
+        public static Message assistant(String reasoningContent, String content, List<ToolCall> toolCalls) {
+            return new Message("assistant", content, reasoningContent, toolCalls, null);
         }
 
         /** 创建 tool 角色消息（回传工具调用结果，需关联对应的调用 ID） */
         public static Message tool(String toolCallId, String content) {
-            return new Message("tool", content, null, toolCallId);
+            return new Message("tool", content, null, null, toolCallId);
         }
     }
 
@@ -351,8 +376,14 @@ public class GLMClient {
      * @param inputTokens  输入 token 用量（prompt_tokens）
      * @param outputTokens 输出 token 用量（completion_tokens）
      */
-    public record ChatResponse(String role, String content, List<ToolCall> toolCalls,
+    public record ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
                                int inputTokens, int outputTokens) {
+
+        public ChatResponse(String role, String content, List<ToolCall> toolCalls,
+                            int inputTokens, int outputTokens) {
+            this(role, content, null, toolCalls, inputTokens, outputTokens);
+        }
+
         /** 判断本次响应是否包含工具调用 */
         public boolean hasToolCalls() {
             return toolCalls != null && !toolCalls.isEmpty();
