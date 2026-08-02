@@ -85,6 +85,22 @@ public class TokenBudget {
     public int getLlmCallCount() { return llmCallCount; }
 
     /**
+     * 估算传入的消息列表占用的 token 数（委托静态 estimateMessagesTokens，供实例调用方便捷使用）。
+     */
+    public int estimateCurrentHistoryTokens(List<GLMClient.Message> history) {
+        return estimateMessagesTokens(history);
+    }
+
+    /**
+     * 计算当前历史占对话可用预算的百分比（0.0~100.0）。
+     */
+    public double getBudgetUsagePercent(List<GLMClient.Message> history) {
+        int available = getAvailableForConversation();
+        if (available <= 0) return 100.0;
+        return (double) estimateCurrentHistoryTokens(history) / available * 100.0;
+    }
+
+    /**
      * 估算消息列表的 token 总数
      */
     public static int estimateMessagesTokens(List<GLMClient.Message> messages) {

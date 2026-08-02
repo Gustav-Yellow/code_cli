@@ -5,6 +5,10 @@ import com.paicli.agent.PlanExecuteAgent;
 import com.paicli.llm.GLMClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.plan.ExecutionPlan;
+import com.paicli.rag.CodeIndex;
+import com.paicli.rag.CodeRelation;
+import com.paicli.rag.CodeRetriever;
+import com.paicli.rag.SearchResultFormatter;
 import org.jline.terminal.Terminal;
 import org.jline.terminal.TerminalBuilder;
 import org.jline.terminal.Attributes;
@@ -22,11 +26,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * PaiCLI v3.0 - Memory-Enhanced Agent CLI
- * 支持 ReAct、Plan-and-Execute 与 Memory 能力
+ * PaiCLI v4.0 - RAG-Enhanced Agent CLI
+ * 支持 ReAct、Plan-and-Execute、Memory 与 RAG 能力
  */
 public class Main {
-    private static final String VERSION = "3.0.0";
+    private static final String VERSION = "4.0.0";
     private static final String ENV_FILE = ".env";
 
     /** 终端括号粘贴模式的前缀标记（xterm 扩展） */
@@ -71,8 +75,8 @@ public class Main {
     public static void main(String[] args) {
         printBanner();
 
-        // 加载 API Key
-        String apiKey = loadApiKey();
+        // 加载 .env 全部配置到 System properties，返回 GLM_API_KEY
+        String apiKey = loadEnvConfig();
         if (apiKey == null || apiKey.isEmpty()) {
             System.err.println("❌ 错误: 未找到 GLM_API_KEY");
             System.err.println("请在 .env 文件中添加: GLM_API_KEY=your_api_key_here");
@@ -97,6 +101,8 @@ public class Main {
             System.out.println("🔄 使用 ReAct 模式\n");
             // nextTaskUsePlanMode：/plan 命令设置此标记，下一条输入走 Plan 模式
             boolean nextTaskUsePlanMode = false;
+
+            printStartupHints();
 
             System.out.println("💡 提示:");
             System.out.println("   - 输入你的问题或任务");
@@ -147,7 +153,7 @@ public class Main {
                     }
                     case MEMORY_STATUS -> {
                         System.out.println("📋 记忆系统状态：");
-                        System.out.println(reactAgent.getMemoryManager().getSystemStatus());
+                        System.out.println(reactAgent.getMemoryManager().getSystemStatus(sharedHistory));
                         System.out.println();
                         continue;
                     }
@@ -166,6 +172,76 @@ public class Main {
                             continue;
                         }
                         input = command.payload();
+                    }
+                    case INDEX_CODE -> {
+                        String indexPath = command.payload() != null ? command.payload() : ".";
+                        System.out.println("📦 正在索引代码库: " + indexPath);
+                        CodeIndex indexer = new CodeIndex(System.out::println);
+                        CodeIndex.IndexResult result = indexer.index(indexPath);
+                        System.out.println(result.message() + "\n");
+
+                        // 同步项目路径到 ToolRegistry，让 search_code 工具可以正常工作
+                        String absPath = new File(indexPath).getAbsolutePath();
+                        reactAgent.getToolRegistry().setProjectPath(absPath);
+                        continue;
+                    }
+                    case SEARCH_CODE -> {
+                        String query = command.payload();
+                        if (query == null || query.isEmpty()) {
+                            showSearchUsage();
+                            continue;
+                        }
+                        System.out.println("🔍 检索: " + query);
+                        try (CodeRetriever retriever = new CodeRetriever(".")) {
+                            var stats = retriever.getStats();
+                            if (stats.chunkCount() == 0) {
+                                System.out.println("⚠️ 代码库尚未索引，请先使用 /index 命令\n");
+                                continue;
+                            }
+                            List<com.paicli.rag.VectorStore.SearchResult> results = retriever.hybridSearch(query, 5);
+                            if (results.isEmpty()) {
+                                System.out.println("📭 未找到相关代码\n");
+                            } else {
+                                System.out.println(SearchResultFormatter.formatForCli(query, results) + "\n");
+                            }
+                        } catch (Exception e) {
+                            System.out.println("❌ 检索失败: " + e.getMessage() + "\n");
+                        }
+                        continue;
+                    }
+                    case GRAPH_QUERY -> {
+                        String className = command.payload();
+                        if (className == null || className.isEmpty()) {
+                            System.out.println("❌ 请提供类名，例如 /graph Main\n");
+                            continue;
+                        }
+                        System.out.println("🕸️ 查询类关系图谱: " + className);
+                        try (CodeRetriever retriever = new CodeRetriever(".")) {
+                            var stats = retriever.getStats();
+                            if (stats.chunkCount() == 0) {
+                                System.out.println("⚠️ 代码库尚未索引，请先使用 /index 命令\n");
+                                continue;
+                            }
+                            List<CodeRelation> relations = retriever.getRelationGraph(className);
+                            if (relations.isEmpty()) {
+                                System.out.println("📭 未找到相关关系\n");
+                            } else {
+                                System.out.println("📋 找到 " + relations.size() + " 条关系:\n");
+                                for (CodeRelation rel : relations) {
+                                    String arrow = rel.relationType().equals("contains") ? "├── contains -->"
+                                            : rel.relationType().equals("extends") ? "└── extends -->"
+                                            : rel.relationType().equals("implements") ? "└── implements -->"
+                                            : rel.relationType().equals("calls") ? "├── calls -->"
+                                            : "├── " + rel.relationType() + " -->";
+                                    System.out.printf("   %s %s [%s]%n", rel.fromName(), arrow,
+                                            rel.toName() != null ? rel.toName() : "unknown");
+                                }
+                                System.out.println();
+                            }
+                        } catch (Exception e) {
+                            System.out.println("❌ 查询失败: " + e.getMessage() + "\n");
+                        }
+                        continue;
                     }
                     case NONE -> {
                     }
@@ -507,6 +583,60 @@ public class Main {
         return normalizeLineEndings(rawInput);
     }
 
+    static List<String> startupHints() {
+        return List.of(
+                "输入你的问题或任务",
+                "输入 '/plan' 后，下一条任务使用 Plan-and-Execute 模式",
+                "输入 '/plan 任务内容' 直接用计划模式执行这条任务",
+                "计划生成后可直接执行、补充要求重规划，或取消",
+                "输入 '/index [路径]' 为代码库建立向量索引",
+                "输入 '/search <查询>' 语义检索代码",
+                "输入 '/graph <类名>' 查看代码关系图谱",
+                "默认模式是 ReAct",
+                "输入 '/clear' 清空对话历史",
+                "输入 '/memory' 查看记忆状态",
+                "输入 '/save 事实内容' 手动保存关键事实",
+                "输入 '/exit' 或 '/quit' 退出"
+        );
+    }
+
+    private static void printStartupHints() {
+        System.out.println("💡 提示:");
+        for (String hint : startupHints()) {
+            System.out.println("   - " + hint);
+        }
+        System.out.println();
+    }
+
+    /**
+     * /search 无参数时的兜底展示：先显示索引状态，再给用法示例。
+     *
+     * <h3>三层策略</h3>
+     * <ol>
+     *   <li>已索引且数据正常 → 展示统计（代码块数 / 关系数）+ 用法示例</li>
+     *   <li>未索引 → 提示先运行 /index</li>
+     *   <li>查询统计异常 → 降级为简单用法提示，不阻塞用户</li>
+     * </ol>
+     */
+    private static void showSearchUsage() {
+        try (CodeRetriever retriever = new CodeRetriever(".")) {
+            var stats = retriever.getStats();
+            if (stats.chunkCount() == 0) {
+                System.out.println("⚠️ 代码库尚未索引，请先使用 /index 命令\n");
+            } else {
+                System.out.println("📊 当前索引: " + stats.chunkCount() + " 个代码块, "
+                        + stats.relationCount() + " 条关系");
+                System.out.println("💡 用法: /search <关键词或自然语言描述>");
+                System.out.println("   例如: /search 用户登录实现");
+                System.out.println("   例如: /search Agent 类的工具调用逻辑\n");
+            }
+        } catch (Exception e) {
+            // 降级兜底：连不上数据库时仍给出基本提示
+            System.out.println("💡 用法: /search <关键词或自然语言描述>");
+            System.out.println("   例如: /search 用户登录实现\n");
+        }
+    }
+
     /** 统一换行符：\r\n 和单独的 \r 都转为 \n，保证跨平台一致性。 */
     static String normalizeLineEndings(String rawInput) {
         return rawInput
@@ -560,44 +690,72 @@ public class Main {
     }
 
     /**
-     * 从 .env 文件加载 API Key
+     * 从 .env 文件加载所有 KEY=VALUE 到 {@link System#setProperty(String, String)}，
+     * 使后续代码通过 {@code System.getProperty(key)} 即可读取配置。
+     *
+     * <h3>加载顺序（与 POSIX .env 语义一致：先到先得）</h3>
+     * <ol>
+     *   <li>当前目录 {@code .env}</li>
+     *   <li>用户主目录 {@code ~/.env}</li>
+     *   <li>OS 环境变量（已在 System.getenv 中，无需 setProperty）</li>
+     * </ol>
+     *
+     * <p>这样 {@link com.paicli.rag.EmbeddingClient#getEnv} 的
+     * {@code System.getProperty(key)} 回退路径就能命中 .env 中的
+     * {@code EMBEDDING_PROVIDER} / {@code EMBEDDING_MODEL} / {@code EMBEDDING_API_KEY}
+     * 等配置，不再需要把这些变量 export 到真正的 OS 环境变量中。</p>
+     *
+     * @return GLM_API_KEY 的值，找不到返回 null
      */
-    private static String loadApiKey() {
-        File envFile = new File(ENV_FILE);
-
-        // 先尝试从当前目录读取
-        if (envFile.exists()) {
-            return readApiKeyFromFile(envFile);
+    private static String loadEnvConfig() {
+        // 步骤1：从 .env 文件加载所有变量到 System properties
+        boolean loadedFromFile = false;
+        for (File envFile : new File[]{new File(ENV_FILE),
+                new File(System.getProperty("user.home"), ENV_FILE)}) {
+            if (envFile.exists()) {
+                loadDotEnvFile(envFile);
+                loadedFromFile = true;
+                break;  // 只加载第一个找到的 .env
+            }
         }
 
-        // 再尝试从用户主目录读取
-        envFile = new File(System.getProperty("user.home"), ENV_FILE);
-        if (envFile.exists()) {
-            return readApiKeyFromFile(envFile);
+        if (loadedFromFile) {
+            // 优先从 System property 取（刚写入的），其次从环境变量取
+            String apiKey = System.getProperty("GLM_API_KEY");
+            if (apiKey != null && !apiKey.isEmpty()) {
+                return apiKey;
+            }
         }
 
-        // 最后尝试从环境变量读取
-        String envKey = System.getenv("GLM_API_KEY");
-        if (envKey != null && !envKey.isEmpty()) {
-            return envKey;
-        }
-
-        return null;
+        // 步骤2：兜底 — 真正的 OS 环境变量
+        return System.getenv("GLM_API_KEY");
     }
 
-    private static String readApiKeyFromFile(File file) {
+    /**
+     * 逐行解析 .env 文件，将每个 {@code KEY=VALUE} 写入 System.setProperty。
+     * 忽略空行和 {@code #} 开头的注释行。
+     */
+    private static void loadDotEnvFile(File file) {
         try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
             String line;
             while ((line = reader.readLine()) != null) {
                 line = line.trim();
-                if (line.startsWith("GLM_API_KEY=")) {
-                    return line.substring("GLM_API_KEY=".length()).trim();
+                if (line.isEmpty() || line.startsWith("#")) {
+                    continue;
+                }
+                int eqIdx = line.indexOf('=');
+                if (eqIdx > 0) {
+                    String key = line.substring(0, eqIdx).trim();
+                    String value = line.substring(eqIdx + 1).trim();
+                    // 如果已通过更高优先级来源设置过，不覆盖
+                    if (System.getProperty(key) == null) {
+                        System.setProperty(key, value);
+                    }
                 }
             }
         } catch (IOException e) {
             System.err.println("读取 .env 文件失败: " + e.getMessage());
         }
-        return null;
     }
 
     private static void printBanner() {
