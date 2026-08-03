@@ -15,7 +15,7 @@
 - **核心依赖**：OkHttp 4.12（HTTP）、Jackson 2.16（JSON）、Logback 1.5（日志）、JLine 3.26（终端）、jieba-analysis 1.0.2（中文分词）、sqlite-jdbc 3.49（SQLite）、javaparser-core 3.28（AST 解析）
 - **默认 LLM**：智谱 GLM-5.2（`https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），OpenAI 兼容协议
 - **入口类**：`com.paicli.cli.Main`
-- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5–21 期见 ROADMAP.md
+- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6–21 期见 ROADMAP.md
 
 设计哲学：**手写优先，框架在后**。21 期主线全部手写完成后，才会开启 Pro 分支用 Spring AI / LangGraph4J 重构做对照实现。日常开发不要提前引入 Spring / LangChain4j 等框架抽象。
 
@@ -34,7 +34,8 @@ paicli/
 │   ├── chapter2-Plan-and-Execute实现.md
 │   ├── chapter3-Memory实现.md
 │   ├── chapter4-RAG开发.md
-│   └── chapter4.1-Streaming_and_Log实现.md
+│   ├── chapter4.1-Streaming_and_Log实现.md
+│   └── chapter5-Multi_Agent开发.md
 └── src/main/java/com/paicli/
     ├── cli/
     │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令
@@ -42,7 +43,11 @@ paicli/
     │   └── PlanReviewInputParser.java # 审查输入解析（EXECUTE/SUPPLEMENT/CANCEL）
     ├── agent/
     │   ├── Agent.java                 # ReAct 循环（思考-行动-观察）
-    │   └── PlanExecuteAgent.java      # Plan-and-Execute 编排 + 计划审查
+    │   ├── PlanExecuteAgent.java      # Plan-and-Execute 编排 + 计划审查
+    │   ├── AgentOrchestrator.java     # Multi-Agent 编排器（主从架构）
+    │   ├── SubAgent.java              # 可配置角色的子代理（规划者/执行者/检查者）
+    │   ├── AgentRole.java             # 角色枚举（PLANNER/WORKER/REVIEWER）
+    │   └── AgentMessage.java          # Agent 间通信消息 record（6 种类型）
     ├── llm/
     │   └── GLMClient.java             # GLM HTTP 客户端 + Message/Tool/ToolCall record
     ├── tool/
@@ -75,6 +80,13 @@ paicli/
         ├── AnsiStyle.java               # ANSI 终端样式辅助类
         ├── JiebaSegmenterFactory.java   # jieba 分词器静默构造工厂
         └── TerminalMarkdownRenderer.java # 流式 Markdown 终端渲染器
+    └── hitl/
+        ├── ApprovalPolicy.java           # 危险操作静态识别（write_file / execute_command / create_project）
+        ├── ApprovalRequest.java          # 审批请求数据模型 + CJK-aware 终端盒子绘制
+        ├── ApprovalResult.java           # 审批决策（APPROVED / APPROVED_ALL / REJECTED / MODIFIED / SKIPPED）
+        ├── HitlHandler.java             # 审批交互接口
+        ├── HitlToolRegistry.java        # 透明 HITL 拦截层（继承 ToolRegistry）
+        └── TerminalHitlHandler.java      # 终端交互实现（y/a/n/s/m + synchronized 并发安全）
 └── src/main/resources/
     └── logback.xml                      # Logback 日志滚动配置
 ```
@@ -94,14 +106,14 @@ paicli/
                    │   (CLI 入口)    │  /plan /index /search /graph
                    └────────┬────────┘
                             │
-              ┌─────────────┴─────────────┐
-              │                           │
-              ▼                           ▼
-       ┌──────────────┐           ┌──────────────┐
-       │ Agent /      │           │ CodeIndex /  │
-       │ PlanExecute  │           │ CodeRetriever│
-       │ Agent        │           │ (RAG 检索)   │
-       └──────┬───────┘           └──────┬───────┘
+              ┌─────────────┼─────────────┐
+              │             │             │
+              ▼             ▼             ▼
+       ┌──────────────┐ ┌──────────┐ ┌──────────────┐
+       │ Agent /      │ │ Agent    │ │ CodeIndex /  │
+       │ PlanExecute  │ │Orchestra-│ │ CodeRetriever│
+       │ Agent        │ │tor(Team) │ │ (RAG 检索)   │
+       └──────┬───────┘ └────┬─────┘ └──────┬───────┘
               │                          │
    ┌──────────┼──────────┐      ┌───────┼───────┐
    │          │          │      │       │       │
@@ -123,9 +135,10 @@ paicli/
 **四种命令模式**（CLI 层通过命令切换）：
 - **ReAct 模式**（默认）：`Agent.run()` 循环调用 LLM + 工具
 - **Plan 模式**（`/plan` 触发）：`PlanExecuteAgent.run()` → `Planner.createPlan()` → 计划审查（HITL）→ 分批并发执行
+- **Team 模式**（`/team` 触发）：`AgentOrchestrator.run()` → 规划者拆解 → 执行者按依赖批次并行 → 检查者审查 → 重试/完成
 - **RAG 检索**（`/search` `/graph`）：`CodeRetriever.hybridSearch()` / `getRelationGraph()` 查询 SQLite 索引
 - **代码索引**（`/index`）：`CodeIndex.index()` 遍历文件 → 分块 → 向量化 → 入库
-- **共享上下文**：ReAct 与 Plan 共享同一个 `List<Message> sharedHistory` + `MemoryManager sharedMemory`
+- **共享上下文**：ReAct、Plan 与 Team 共享同一个 `List<Message> sharedHistory` + `MemoryManager sharedMemory`
 
 ---
 
@@ -232,6 +245,76 @@ paicli/
   - SLF4J 日志埋点（plan 开始/完成、task 执行/完成/失败、工具调用）
 - 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 15 节 + `docs/chapter3-Memory实现.md` + `docs/chapter4.1-Streaming_and_Log实现.md` 第 6 节
 
+### 4.5b `agent.AgentOrchestrator` — Multi-Agent 编排器（第 5 期新增）
+
+- 文件：`src/main/java/com/paicli/agent/AgentOrchestrator.java`
+- 职责：Multi-Agent 系统的"主"，采用主从架构管理团队、分配任务、路由消息、解决冲突
+- **协作流程**：
+  1. 用户提交任务 → 编排器交给规划者（SubAgent/PLANNER）
+  2. 规划者拆解任务为 JSON 执行计划 → 编排器解析为 `List<ExecutionStep>`
+  3. 编排器按依赖顺序将子任务分配给执行者（SubAgent/WORKER，默认 2 个轮询分配）
+  4. 执行者返回结果 → 编排器交给检查者（SubAgent/REVIEWER）
+  5. 检查者审批通过则完成，未通过则带反馈重试（最多 2 次）
+  6. 所有子任务完成后，编排器汇总返回最终结果
+- **并行策略**：
+  - 同一依赖批次内部**并行**执行（最多 Worker 池大小并发，默认 2）
+  - 每个并行步骤使用独立 `PrintStream` 缓冲流式输出，批次结束后按 `step_id` 顺序 flush 到 stdout
+  - Worker 通过 `BlockingQueue` 池化分配，确保同一 Worker 不会被两个步骤并发占用
+  - Reviewer 在并行路径中按步骤即时创建独立实例，避免对话历史竞争
+- **关键方法**：
+  - `run(userInput)`：编排主流程（压缩上下文 → 检索记忆 → 规划 → 解析 → 波次执行 → 汇总 → 写回 sharedHistory + 长期记忆）
+  - `parsePlan(planJson)`：两遍扫描解析 LLM 输出的 JSON 计划（去 markdown 包裹、ID 重编号、依赖回填、兼容 `tasks` 字段）
+  - `getExecutableSteps(steps)`：隐式波次推进——每轮重新扫描状态表，找所有依赖已完成的 PENDING 步骤
+  - `runStep(step, steps, retryCount, worker, reviewer, context, out)`：单步执行（Worker 执行 + Reviewer 审查 + 最多 2 次重试，重试时把反馈注入上下文）
+  - `runBatchParallel(batch, steps, retryCount)`：多步骤线程池并行 + Worker 池化 + 按序 flush
+  - `parseReviewApproval(content)`：JSON 优先解析 → 关键词回退 → 保守策略（解析失败默认不通过）
+  - `parseReviewIssues(content)`：依次取 `issues` / `suggestions` / `summary` 字段
+- **内部类型**：
+  - `ExecutionStep` record：步骤数据模型（id / description / type / dependencies / result / StepStatus），提供 `pending()` / `withResult()` / `withFailed()` / `started()` 工厂方法
+  - `StepStatus` enum：PENDING / RUNNING / COMPLETED / FAILED
+- **构造器链**：支持 `(apiKey)` / `(apiKey, toolRegistry)` / `(apiKey, toolRegistry, memoryManager)` / `(apiKey, toolRegistry, memoryManager, sharedHistory)` 四种初始化方式，`Main` 注入共享历史实现三模式上下文互通
+- **记忆集成**：
+  - 短期：`sharedHistory`（compressContextIfNeeded → add user → write assistant）
+  - 长期：`buildContextForQuery` 检索 → `extractAndSaveFacts` 提取
+- 详见 `docs/chapter5-Multi_Agent开发.md`
+
+### 4.5c `agent.SubAgent` — 子代理（第 5 期新增）
+
+- 文件：`src/main/java/com/paicli/agent/SubAgent.java`
+- 职责：可配置角色的轻量 Agent，每个实例有独立的角色、系统提示词和对话历史，但共享 LLM 客户端和工具注册表
+- **三套角色系统提示词**：
+  | 角色 | 提示词常量 | 是否使用工具 |
+  |------|-----------|-------------|
+  | `PLANNER` | `PLANNER_PROMPT`（任务分解 → JSON 执行计划） | ❌ |
+  | `WORKER` | `WORKER_PROMPT`（工具调用 → 具体操作） | ✅ |
+  | `REVIEWER` | `REVIEWER_PROMPT`（质量检查 → 审批 JSON） | ❌ |
+- **关键方法**：
+  - `execute(task, out)`：注入任务到对话历史 → ReAct 循环（最多 10 轮）→ 返回 `AgentMessage.result()` 或 `.error()`
+  - `executeWithContext(task, context, out)`：带上下文注入的执行（Worker 接收依赖步骤结果）
+  - `review(originalTask, executionResult, out)`：拼接原始任务 + 执行结果 → Reviewer 输出审批 JSON
+  - `clearHistory()`：保留 system 提示词，清空对话历史
+  - `shouldUseTools()`：只有 `WORKER` 角色返回 true
+- **`SubAgentStreamRenderer`**（内部类）：实现 `GLMClient.StreamListener`
+  - 双通道分离：reasoning → 「🧠 执行思考/规划思考/审查思考」+ content → 「🤖 执行结果/规划结果/审查结果」
+  - 防空白标题：`pendingReasoning` 缓冲区等攒够实质内容才触发渲染
+  - 迟到推理不渲染：content 开始后收到的 reasoning 不显示（终端无法回头插入），但完整 reasoning 仍写入 conversationHistory
+  - 输出重定向：通过 `PrintStream out` 参数支持并行模式下写入独立 `ByteArrayOutputStream`
+- 详见 `docs/chapter5-Multi_Agent开发.md` 第 4 节
+
+### 4.5d `agent.AgentRole` — 角色枚举（第 5 期新增）
+
+- 文件：`src/main/java/com/paicli/agent/AgentRole.java`
+- 三个枚举值：`PLANNER("规划者", "负责分析用户任务，制定执行计划...")`、`WORKER("执行者", "负责执行具体任务步骤...")`、`REVIEWER("检查者", "负责检查执行结果的质量和正确性...")`
+- 每个枚举值持有 `displayName`（中文显示名）和 `description`（职责描述）
+
+### 4.5e `agent.AgentMessage` — 通信消息（第 5 期新增）
+
+- 文件：`src/main/java/com/paicli/agent/AgentMessage.java`
+- Java 17 `record`：`AgentMessage(fromAgent, fromRole, content, type)`
+- 6 种消息类型（`Type` enum）：`TASK`（任务分配）、`RESULT`（执行结果）、`FEEDBACK`（审查反馈）、`APPROVAL`（批准）、`REJECTION`（拒绝）、`ERROR`（系统错误）
+- 静态工厂方法：`task()` / `result()` / `feedback()` / `approval()` / `rejection()` / `error()`
+- `Type.ERROR` 由调用方独立处理（与 `RESULT` 区分），SubAgent 在 LLM 调用失败或达到最大迭代时返回
+
 ### 4.6 `plan.Planner` — LLM 任务分解（第 2 期基础，第 3/4.1 期增强）
 
 - 文件：`src/main/java/com/pacicli/plan/Planner.java`
@@ -332,7 +415,19 @@ paicli/
   - 核心方法：`append(chunk)` 流式追加 → `flushCompleteLines()` 按行刷出 → `flushPending()` 强制刷出残留文本 → `finish()` 收尾关闭代码块
 - 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 3-4 节
 
-### 4.12 `resources/logback.xml` — 日志配置（第 4.1 期新增）
+### 4.12 `hitl` 包 — HITL 审批系统（第 6 期）
+
+- 文件：`src/main/java/com/paicli/hitl/` 下 6 个类（见目录树）
+- **整体设计**：
+  - `ApprovalPolicy` 通过静态规则识别危险工具（`write_file` / `execute_command` / `create_project`），提供三级危险等级（🔴高危 / 🟡中危 / 🟢安全）
+  - `HitlToolRegistry` 作为透明拦截层继承 `ToolRegistry`，HITL 关闭时行为与父类完全相同
+  - `TerminalHitlHandler` 默认关闭，通过 `/hitl on|off` 运行时切换；支持 `[y/Enter]` 批准 / `[a]` 全部放行 / `[n]` 拒绝 / `[s]` 跳过 / `[m]` 修改参数后执行
+  - `ApprovedAllTools` 在 `/clear` 时自动重置
+- **Agent 集成**：`Agent` 和 `PlanExecuteAgent` 新增接受外部 `ToolRegistry` 的构造器，`Main` 启动时将 `HitlToolRegistry` 注入三个 Agent 模式（ReAct / Plan / Team）
+- **CLI 命令**：`/hitl on|off|status` + `/memory clear`
+- **与流式输出的协同**：`StreamRenderer.resetBetweenIterations()` 在工具调用前 flush 并重置渲染器，避免 Markdown pending 文本被 HITL 提示"跨过"
+
+### 4.13 `resources/logback.xml` — 日志配置（第 4.1 期新增）
 
 - 文件：`src/main/resources/logback.xml`
 - 配置：`RollingFileAppender` + `SizeAndTimeBasedRollingPolicy`
@@ -381,8 +476,8 @@ java -jar target/paicli-0.0.1-SNAPSHOT.jar
 |---|---|---|---|
 | 3 | Memory 系统 | `MemoryManager` / `ContextCompressor` / `LongTermMemory` / `MemoryRetriever` / `TokenBudget` | 已完成 → [4.9](#49-memory-包--memory-系统第-3-期) + `docs/chapter3-Memory实现.md` |
 | 4 | RAG 检索 | `VectorStore` / `CodeIndex` / `CodeChunker` / `CodeAnalyzer` / `EmbeddingClient` / `CodeRetriever` | 已完成 → [4.10](#410-rag-包--rag-代码检索第-4-期) + `docs/chapter4-RAG开发.md` |
-| 5 | Multi-Agent | `AgentOrchestrator` / `SubAgent` | 未开始 |
-| 6 | HITL 审批 | `HitlToolRegistry` / `PathGuard` / `CommandGuard` / `AuditLog` | 部分实现（第 2 期已有计划审查 HITL，第 6 期补充危险操作审批） |
+| 5 | Multi-Agent | `AgentOrchestrator` / `SubAgent` / `AgentRole` / `AgentMessage` | 已完成 → [4.5b–4.5e](#45b-agentagentorchestrator--multi-agent-编排器第-5-期新增) + `docs/chapter5-Multi_Agent开发.md` |
+| 6 | HITL 审批 | `HitlToolRegistry` / `ApprovalPolicy` / `ApprovalRequest` / `ApprovalResult` / `HitlHandler` / `TerminalHitlHandler` | 已完成 → [4.12](#412-hitl-包--hitl-审批系统第-6-期) |
 | 7 | 异步并行 | `BatchToolExecutor` | 部分实现（第 2 期已有分批并行执行，第 7 期补充更高级的异步调度） |
 | 8 | 多模型 | `LlmClient` 接口 / `AbstractOpenAiCompatibleClient` / `DeepSeekClient` / `StepClient` / `KimiClient` | 未开始 |
 | 9 | 联网工具 | `web_search` / `web_fetch` | 未开始 |
