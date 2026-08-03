@@ -15,7 +15,7 @@
 - **核心依赖**：OkHttp 4.12（HTTP）、Jackson 2.16（JSON）、Logback 1.5（日志）、JLine 3.26（终端）、jieba-analysis 1.0.2（中文分词）、sqlite-jdbc 3.49（SQLite）、javaparser-core 3.28（AST 解析）
 - **默认 LLM**：智谱 GLM-5.2（`https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），OpenAI 兼容协议
 - **入口类**：`com.paicli.cli.Main`
-- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7 期（异步并行工具执行）已完成并文档化（`docs/Chapter7-Async_Parallel实现.md`）；第 8–21 期见 ROADMAP.md
+- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7 期（异步并行工具执行）已完成并文档化（`docs/Chapter7-Async_Parallel实现.md`）；第 7.1 期（LLMClient 多模型适配）已完成并文档化（`docs/Chapter7.1-LLMClient开发.md`）；第 8 期（Web Search Tool 联网工具）已完成并文档化（`docs/Chapter8-Web_Search_Tool开发.md`）；第 9–21 期见 ROADMAP.md
 
 设计哲学：**手写优先，框架在后**。21 期主线全部手写完成后，才会开启 Pro 分支用 Spring AI / LangGraph4J 重构做对照实现。日常开发不要提前引入 Spring / LangChain4j 等框架抽象。
 
@@ -38,6 +38,8 @@ paicli/
 │   └── chapter5-Multi_Agent开发.md
 │   └── Chapter6-HITL实现.md
 │   └── Chapter7-Async_Parallel实现.md
+│   └── Chapter7.1-LLMClient开发.md
+│   └── Chapter8-Web_Search_Tool开发.md
 └── src/main/java/com/paicli/
     ├── cli/
     │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令
@@ -45,15 +47,20 @@ paicli/
     │   └── PlanReviewInputParser.java # 审查输入解析（EXECUTE/SUPPLEMENT/CANCEL）
     ├── agent/
     │   ├── Agent.java                 # ReAct 循环（思考-行动-观察）
+    │   ├── AgentBudget.java           # Agent 循环退出预算（Token/停滞/硬轮数保险阀）
     │   ├── PlanExecuteAgent.java      # Plan-and-Execute 编排 + 计划审查
     │   ├── AgentOrchestrator.java     # Multi-Agent 编排器（主从架构）
     │   ├── SubAgent.java              # 可配置角色的子代理（规划者/执行者/检查者）
     │   ├── AgentRole.java             # 角色枚举（PLANNER/WORKER/REVIEWER）
     │   └── AgentMessage.java          # Agent 间通信消息 record（6 种类型）
     ├── llm/
-    │   └── GLMClient.java             # GLM HTTP 客户端 + Message/Tool/ToolCall record
+    │   ├── LlmClient.java                        # LLM 客户端接口
+    │   ├── AbstractOpenAiCompatibleClient.java   # OpenAI 兼容 API 抽象基类（SSE/流式解析/超时可配）
+    │   ├── GLMClient.java                        # GLM 模型客户端（智谱 AI）
+    │   ├── DeepSeekClient.java                   # DeepSeek 模型客户端
+    │   └── LlmClientFactory.java                 # LLM 客户端工厂（按 provider 创建）
     ├── tool/
-    │   └── ToolRegistry.java          # 6 个内置工具（含 search_code）+ JSON Schema 生成 + 工具执行
+    │   └── ToolRegistry.java          # 8 个内置工具（含 web_search/web_fetch）+ JSON Schema 生成 + 并行工具执行
     ├── plan/
     │   ├── Planner.java               # LLM 驱动的任务分解
     │   ├── ExecutionPlan.java         # 计划 DAG + 拓扑排序 + 批次计算
@@ -82,6 +89,17 @@ paicli/
         ├── AnsiStyle.java               # ANSI 终端样式辅助类
         ├── JiebaSegmenterFactory.java   # jieba 分词器静默构造工厂
         └── TerminalMarkdownRenderer.java # 流式 Markdown 终端渲染器
+    └── web/
+        ├── FetchResult.java            # web_fetch 结构化结果 record
+        ├── HtmlExtractor.java          # HTML → Markdown 正文提取（Jsoup 极简 readability）
+        ├── NetworkPolicy.java          # 网络访问策略（SSRF 防护 + Token Bucket 限流）
+        ├── SearchProvider.java         # 搜索引擎接口抽象
+        ├── SearchProviderFactory.java  # SearchProvider 工厂（自动按 Key/URL 选择实现）
+        ├── SearchResult.java           # 搜索结果 record
+        ├── SearxngSearchProvider.java  # SearXNG 搜索 provider（骨架）
+        ├── SerpApiSearchProvider.java  # SerpAPI 搜索 provider（骨架）
+        ├── WebFetcher.java             # HTTP 抓取器（5MB 上限、30s 超时、charset 解析）
+        └── ZhipuSearchProvider.java    # 智谱 Web Search provider（完整实现）
     └── hitl/
         ├── ApprovalPolicy.java           # 危险操作静态识别（write_file / execute_command / create_project）
         ├── ApprovalRequest.java          # 审批请求数据模型 + CJK-aware 终端盒子绘制
@@ -122,7 +140,7 @@ paicli/
    ▼          ▼          ▼      ▼       ▼       ▼
 ┌──────┐ ┌────────┐ ┌──────┐ ┌────┐ ┌──────┐ ┌──────┐
 │GLM   │ │ToolReg │ │Plan  │ │Emb │ │Code  │ │Vector│
-│Client│ │(6工具) │ │(分解)│ │Cli │ │Chunk │ │Store │
+│Client│ │(8工具) │ │(分解)│ │Cli │ │Chunk │ │Store │
 └──────┘ └────────┘ └──────┘ │ent │ │er    │ │(SQL) │
    │          │               └────┘ └──────┘ └──────┘
    │          │                  │
@@ -181,10 +199,15 @@ paicli/
 - 系统提示词硬编码在 `SYSTEM_PROMPT` 常量里，第 19 期会迁移到 `src/main/resources/prompts/` 分层架构
 - 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 5 节
 
-### 4.3 `llm.GLMClient` — LLM HTTP 客户端（第 1 期基础，第 4.1 期增强）
+### 4.3 `llm` 包 — LLM 客户端（第 1 期基础，第 4.1/7.1 期增强）
 
-- 文件：`src/main/java/com/paicli/llm/GLMClient.java`
-- 端点：`https://open.bigmodel.cn/api/paas/v4/chat/completions`，模型 `glm-5.2`
+- 文件：`src/main/java/com/paicli/llm/` 下 5 个类
+- **接口**：`LlmClient` — 定义 `chat()` 两个重载 + 内嵌数据模型（`Message` / `Tool` / `ToolCall` / `ChatResponse` / `StreamListener`）
+- **抽象基类**：`AbstractOpenAiCompatibleClient` — HTTP 请求构建、SSE 流式解析、tool_call 增量合并、超时可配（`paicli.llm.*.timeout.seconds`）
+- **具体实现**：
+  - `GLMClient`：端点 `https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`，模型 `glm-5.1`
+  - `DeepSeekClient`：端点 `https://api.deepseek.com/chat/completions`，模型 `deepseek-v4-flash`
+- **工厂**：`LlmClientFactory` — 按 provider 名称创建，自动回退
 - OkHttp 超时：connect 60s / read 300s（流式 SSE 需要放宽）/ write 60s / call 600s
 - 内嵌 record 数据模型：
   - `Message`（role + content + tool_calls + tool_call_id + reasoningContent），提供 `system()` / `user()` / `assistant()` / `tool()` 静态工厂
@@ -200,10 +223,10 @@ paicli/
 - 第 8 期会抽象出 `LlmClient` 接口与 `AbstractOpenAiCompatibleClient` 基类，届时 GLMClient 会瘦身为子类
 - 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 2 节
 
-### 4.4 `tool.ToolRegistry` — 工具注册表（第 1 期基础，第 4 期增强）
+### 4.4 `tool.ToolRegistry` — 工具注册表（第 1 期基础，第 4/7/8 期增强）
 
 - 文件：`src/main/java/com/paicli/tool/ToolRegistry.java`
-- 6 个内置工具：
+- 8 个内置工具：
   | 工具名 | 参数 | 用途 | 期次 |
   |---|---|---|---|
   | `read_file` | `path` | 读取文件 | 1 |
@@ -212,6 +235,8 @@ paicli/
   | `execute_command` | `command` | `bash -c` 执行 Shell | 1 |
   | `create_project` | `name`, `type` | 创建 java/python/node 脚手架 | 1 |
   | `search_code` | `query`, `top_k` | 语义检索代码库（混合检索） | 4 |
+  | `web_search` | `query`, `top_k` | 联网搜索（智谱 Web Search，复用 GLM_API_KEY） | 8 |
+  | `web_fetch` | `url`, `max_chars` | 抓取 URL 提取正文 Markdown | 8 |
 - 关键设计：
   - `Tool` record 含 `executor`（函数式接口 `ToolExecutor`），注册时用 lambda 提供执行逻辑
   - `createParameters(Param...)` 动态生成 JSON Schema（type/description/required），传给 LLM
@@ -469,6 +494,47 @@ paicli/
 - **HITL 兼容**：`HitlToolRegistry` 继承 `ToolRegistry`，`executeTools()` 自动获得 HITL 拦截能力，无需额外适配。
 - 详见 `docs/Chapter7-Async_Parallel实现.md`
 
+### 4.15 `web` 包 — Web Search Tool 联网工具（第 8 期）
+
+- 文件：`src/main/java/com/paicli/web/` 下 10 个类（见目录树，含 `agent/AgentBudget.java`）
+- **整体设计**：
+  - `SearchProvider` 接口抽象三种搜索引擎实现，`SearchProviderFactory` 按 `GLM_API_KEY` / `SERPAPI_KEY` / `SEARXNG_URL` 自动选择
+  - `web_search` 和 `web_fetch` 两个工具注册在 `ToolRegistry.registerWebTools()` 中，通过懒加载 getter 初始化 provider
+  - `web_fetch` 流水线：`NetworkPolicy.checkUrl()`（SSRF 防护）→ `NetworkPolicy.acquire()`（限流）→ `WebFetcher.fetch()`（HTTP GET）→ `HtmlExtractor.extract()`（HTML → Markdown）→ 截断格式化
+- **核心类**：
+
+| 类 | 职责 |
+|---|---|
+| `SearchProvider` | 搜索引擎接口（name/isReady/unavailableHint/search） |
+| `ZhipuSearchProvider` | **默认 provider**：智谱 Web Search（`POST /api/paas/v4/web_search`），复用 GLM_API_KEY |
+| `SerpApiSearchProvider` | 骨架实现：商业聚合 API（需 SERPAPI_KEY） |
+| `SearxngSearchProvider` | 骨架实现：开源自托管搜索引擎（需 SEARXNG_URL） |
+| `SearchProviderFactory` | 工厂类：自动按 Key/URL 选择 provider，支持显式 SEARCH_PROVIDER 指定 |
+| `SearchResult` | 搜索结果 record（position/title/url/snippet/source） |
+| `WebFetcher` | HTTP 抓取器（5MB 上限、30s 超时、charset 解析） |
+| `HtmlExtractor` | Jsoup 极简 readability（去噪→打分选主容器→递归转 Markdown） |
+| `NetworkPolicy` | 安全策略（scheme 白名单 + SSRF 黑名单 + Token Bucket 限流 60s/30 次） |
+| `FetchResult` | web_fetch 结果 record（含 bodyEmpty 标记，提示 SPA 空正文边界） |
+| `AgentBudget`（位于 `agent/` 包） | Agent 循环退出预算：Token 预算（300K）+ 停滞检测 + 硬轮数兜底（50 轮），替代硬编码 MAX_ITERATIONS |
+
+- **配置（`.env`）**：
+  ```bash
+  # 搜索 provider（不配置时自动按 Key/URL 判断）
+  # SEARCH_PROVIDER=zhipu
+  # 智谱搜索引擎（search_std/search_pro/search_pro_sogou/search_pro_quark）
+  # ZHIPU_SEARCH_ENGINE=search_pro
+  # SerpAPI Key（SEARCH_PROVIDER=serpapi 时启用）
+  # SERPAPI_KEY=your_key
+  # SearXNG 地址（SEARCH_PROVIDER=searxng 时启用）
+  # SEARXNG_URL=http://localhost:8888
+  ```
+- **Agent 集成**：
+  - Agent / SubAgent / PlanExecuteAgent 的 Prompt 均已增加 web 工具说明 + 工具选择优先级规则
+  - Agent / SubAgent 的循环已从硬编码 `MAX_ITERATIONS=10` 改为 `AgentBudget.fromSystemProperties()` 动态预算
+  - `AbstractOpenAiCompatibleClient` HTTP 超时改为系统属性可配（`paicli.llm.*.timeout.seconds`）
+- **依赖**：jsoup 1.18.1（HTML 解析）
+- 详见 `docs/Chapter8-Web_Search_Tool开发.md`
+
 ---
 
 ## 5. 开发与运行
@@ -479,10 +545,14 @@ paicli/
 # 在项目根目录或 ~ 下放 .env（支持所有 KEY=VALUE 配置）
 cat > .env << 'EOF'
 GLM_API_KEY=your_zhipu_api_key
+DEEPSEEK_API_KEY=your_deepseek_api_key
 # Embedding 配置（可选，默认 Ollama 本地）
 EMBEDDING_PROVIDER=glm
 EMBEDDING_MODEL=embedding-3
 EMBEDDING_API_KEY=your_zhipu_api_key
+# Web 搜索配置（可选，有 GLM_API_KEY 时自动启用 zhipu）
+# SEARCH_PROVIDER=zhipu
+# ZHIPU_SEARCH_ENGINE=search_pro
 EOF
 ```
 
@@ -509,8 +579,8 @@ java -jar target/paicli-0.0.1-SNAPSHOT.jar
 | 5 | Multi-Agent | `AgentOrchestrator` / `SubAgent` / `AgentRole` / `AgentMessage` | 已完成 → [4.5b–4.5e](#45b-agentagentorchestrator--multi-agent-编排器第-5-期新增) + `docs/chapter5-Multi_Agent开发.md` |
 | 6 | HITL 审批 | `HitlToolRegistry` / `ApprovalPolicy` / `ApprovalRequest` / `ApprovalResult` / `HitlHandler` / `TerminalHitlHandler` | 已完成 → [4.12](#412-hitl-包--hitl-审批系统第-6-期) |
 | 7 | 异步并行 | `ToolRegistry.executeTools` / `ToolInvocation` / `ToolExecutionResult` | 已完成 → [4.14](#414-toolregistry-第-7-期增强) |
-| 8 | 多模型 | `LlmClient` 接口 / `AbstractOpenAiCompatibleClient` / `DeepSeekClient` / `StepClient` / `KimiClient` | 未开始 |
-| 9 | 联网工具 | `web_search` / `web_fetch` | 未开始 |
+| 8 | 多模型 + 联网工具 | `LlmClient` 接口 / `AbstractOpenAiCompatibleClient` / `DeepSeekClient` / `AgentBudget` / `SearchProvider` / `ZhipuSearchProvider` / `WebFetcher` / `HtmlExtractor` / `NetworkPolicy` | 已完成 → [4.15](#415-web-包--web-search-tool-联网工具第-8-期) + `docs/Chapter7.1-LLMClient开发.md` + `docs/Chapter8-Web_Search_Tool开发.md` |
+| 9 | MCP 协议核心 | `JsonRpcClient` / `McpTransport` / `McpServerManager` | 未开始 |
 | 10–11 | MCP | `JsonRpcClient` / `McpTransport` / `McpServerManager` | 未开始 |
 | 12 | 长上下文 | `AgentBudget` / `ContextProfile` | 未开始 |
 | 13–14 | Chrome DevTools MCP | 浏览器接入 | 未开始 |
