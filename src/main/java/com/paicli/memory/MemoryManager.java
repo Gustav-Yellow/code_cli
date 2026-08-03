@@ -1,7 +1,7 @@
 package com.paicli.memory;
 
-import com.paicli.llm.GLMClient;
-import com.paicli.llm.GLMClient.Message;
+import com.paicli.llm.LlmClient;
+import com.paicli.llm.LlmClient.Message;
 
 import java.util.List;
 import java.util.UUID;
@@ -25,19 +25,26 @@ public class MemoryManager {
     // 保留最近 N 轮完整消息不压缩
     private static final int RETAIN_RECENT_ROUNDS = 3;
 
-    public MemoryManager(GLMClient llmClient) {
+    public MemoryManager(LlmClient llmClient) {
         this(llmClient, 200000, null);
     }
 
-    public MemoryManager(GLMClient llmClient, int contextWindow) {
+    public MemoryManager(LlmClient llmClient, int contextWindow) {
         this(llmClient, contextWindow, null);
     }
 
-    public MemoryManager(GLMClient llmClient, int contextWindow, LongTermMemory longTermMemory) {
+    public MemoryManager(LlmClient llmClient, int contextWindow, LongTermMemory longTermMemory) {
         this.longTermMemory = longTermMemory != null ? longTermMemory : new LongTermMemory();
         this.compressor = new ContextCompressor(llmClient);
         this.retriever = new MemoryRetriever(this.longTermMemory);
         this.tokenBudget = new TokenBudget(contextWindow);
+    }
+
+    /**
+     * 更新 LLM 客户端（用于运行时模型切换）
+     */
+    public void setLlmClient(LlmClient llmClient) {
+        this.compressor.setLlmClient(llmClient);
     }
 
     /**

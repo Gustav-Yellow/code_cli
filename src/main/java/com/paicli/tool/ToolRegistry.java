@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.paicli.llm.GLMClient;
+import com.paicli.llm.LlmClient;
 import com.paicli.rag.CodeRetriever;
 import com.paicli.rag.SearchResultFormatter;
 import com.paicli.rag.VectorStore;
@@ -307,12 +307,12 @@ public class ToolRegistry {
     /**
      * 获取所有工具定义（用于LLM）
      *
-     * 这个方法把内部 Tool（含 executor）转换成 GLMClient.Tool（不含 executor），
-     * 用于塞进 GLMClient.chat() 的 tools 参数
+     * 这个方法把内部 Tool（含 executor）转换成 LlmClient.Tool（不含 executor），
+     * 用于塞进 LlmClient.chat() 的 tools 参数
      */
-    public List<GLMClient.Tool> getToolDefinitions() {
+    public List<LlmClient.Tool> getToolDefinitions() {
         return tools.values().stream()
-                .map(t -> new com.paicli.llm.GLMClient.Tool(t.name(), t.description(), t.parameters()))
+                .map(t -> new com.paicli.llm.LlmClient.Tool(t.name(), t.description(), t.parameters()))
                 .toList();
     }
 
@@ -321,8 +321,8 @@ public class ToolRegistry {
      * <p>
      * Agent 拿到 LLM 返回的工具调用后，通过本方法在本地真正执行工具。
      * 入参 {@code name} 和 {@code argumentsJson} 分别对应
-     * {@code GLMClient.ToolCall.function().name()} 和
-     * {@code GLMClient.ToolCall.function().arguments()}。
+     * {@code LlmClient.ToolCall.function().name()} 和
+     * {@code LlmClient.ToolCall.function().arguments()}。
      *
      * <h3>执行步骤：</h3>
      * <ol>
@@ -354,8 +354,8 @@ public class ToolRegistry {
      * // 包成 Message.tool(tc.id(), result) 追加到 messages，发起下一轮 chat()
      * }</pre>
      *
-     * @param name          工具名，来自 GLMClient.ToolCall.function().name()
-     * @param argumentsJson 参数 JSON 字符串，来自 GLMClient.ToolCall.function().arguments()
+     * @param name          工具名，来自 LlmClient.ToolCall.function().name()
+     * @param argumentsJson 参数 JSON 字符串，来自 LlmClient.ToolCall.function().arguments()
      * @return 工具执行结果字符串，会被原样回传给 LLM
      */
     public String executeTool(String name, String argumentsJson) {

@@ -2,6 +2,7 @@ package com.paicli.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.llm.LlmClient;
 import com.paicli.llm.GLMClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.tool.ToolRegistry;
@@ -42,14 +43,14 @@ public class AgentOrchestrator {
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final int MAX_RETRIES_PER_STEP = 2;
 
-    private final GLMClient llmClient;
+    private final LlmClient llmClient;
     private final SubAgent planner;
     private final List<SubAgent> workers;
     private final SubAgent reviewer;
     private final MemoryManager memoryManager;
     private final ToolRegistry toolRegistry;
     /** 会话级共享对话历史 —— 与 ReAct/Plan 共享，/team 执行结果写回后切回其他模式时上下文连续 */
-    private final List<GLMClient.Message> sharedHistory;
+    private final List<LlmClient.Message> sharedHistory;
 
     // 执行步骤的数据结构（package-private 供测试访问）
     record ExecutionStep(String id, String description, String type,
@@ -96,12 +97,12 @@ public class AgentOrchestrator {
      * 让 Multi-Agent 与 ReAct/Plan 共享同一份对话历史，/team 执行结果写回后上下文连续。
      */
     public AgentOrchestrator(String apiKey, ToolRegistry toolRegistry,
-                             MemoryManager memoryManager, List<GLMClient.Message> sharedHistory) {
+                             MemoryManager memoryManager, List<LlmClient.Message> sharedHistory) {
         this(new GLMClient(apiKey), toolRegistry, memoryManager, sharedHistory);
     }
 
-    public AgentOrchestrator(GLMClient llmClient, ToolRegistry toolRegistry,
-                             MemoryManager memoryManager, List<GLMClient.Message> sharedHistory) {
+    public AgentOrchestrator(LlmClient llmClient, ToolRegistry toolRegistry,
+                             MemoryManager memoryManager, List<LlmClient.Message> sharedHistory) {
         this.llmClient = llmClient;
         this.toolRegistry = toolRegistry;
         this.planner = new SubAgent("planner", AgentRole.PLANNER, llmClient, toolRegistry);
@@ -131,7 +132,7 @@ public class AgentOrchestrator {
 
         // 添加本轮用户消息到共享历史
         if (sharedHistory != null) {
-            sharedHistory.add(GLMClient.Message.user(userInput));
+            sharedHistory.add(LlmClient.Message.user(userInput));
         }
 
         // 1. 规划阶段：让规划者拆解任务
@@ -206,13 +207,13 @@ public class AgentOrchestrator {
 
         // 写回共享历史：让切回 ReAct 时上下文连续（与 PlanExecuteAgent 行为对齐）
         if (sharedHistory != null && finalResult != null && !finalResult.isBlank()) {
-            sharedHistory.add(GLMClient.Message.assistant(finalResult));
+            sharedHistory.add(LlmClient.Message.assistant(finalResult));
         }
 
         // 从执行步骤构建合成对话历史，提取关键事实到长期记忆
-        List<GLMClient.Message> syntheticHistory = new ArrayList<>();
-        syntheticHistory.add(GLMClient.Message.user(userInput));
-        syntheticHistory.add(GLMClient.Message.assistant("[多Agent结果] " + finalResult));
+        List<LlmClient.Message> syntheticHistory = new ArrayList<>();
+        syntheticHistory.add(LlmClient.Message.user(userInput));
+        syntheticHistory.add(LlmClient.Message.assistant("[多Agent结果] " + finalResult));
         memoryManager.extractAndSaveFacts(syntheticHistory);
 
         return finalResult;
@@ -584,7 +585,7 @@ public class AgentOrchestrator {
      * 从共享历史取最近 maxMessages 条（跳过 index 0 的 system prompt），
      * 格式化为 "role: content" 供规划时参考。压缩摘要若落在窗口内自然被包含。
      */
-    private String buildPriorContext(List<GLMClient.Message> history, int maxMessages) {
+    private String buildPriorContext(List<LlmClient.Message> history, int maxMessages) {
         if (history == null || history.size() <= 1) {
             return "";
         }
@@ -592,7 +593,7 @@ public class AgentOrchestrator {
         StringBuilder sb = new StringBuilder();
         sb.append("之前的对话上下文：\n");
         for (int i = start; i < history.size(); i++) {
-            GLMClient.Message m = history.get(i);
+            LlmClient.Message m = history.get(i);
             sb.append(m.role()).append(": ").append(m.content()).append("\n");
         }
         return sb.toString();

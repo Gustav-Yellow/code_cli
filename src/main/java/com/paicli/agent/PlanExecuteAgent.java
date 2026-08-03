@@ -2,6 +2,7 @@ package com.paicli.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.llm.LlmClient;
 import com.paicli.llm.GLMClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.plan.*;
@@ -114,14 +115,14 @@ public class PlanExecuteAgent {
         }
     }
 
-    private final GLMClient llmClient;
+    private final LlmClient llmClient;
     private final ToolRegistry toolRegistry;
     private final Planner planner;
     /** 审查回调 —— 由 CLI 层注入，控制是否弹交互式审查界面 */
     private final PlanReviewHandler reviewHandler;
     private final MemoryManager memoryManager;
     /** 会话级共享对话历史 —— 与 ReAct 共享，模式切换时上下文连续 */
-    private final List<GLMClient.Message> sharedHistory;
+    private final List<LlmClient.Message> sharedHistory;
 
 
     private static final String EXECUTION_PROMPT = """
@@ -153,34 +154,38 @@ public class PlanExecuteAgent {
      * 无审查构造器：生成计划后直接执行，不弹交互界面。
      */
     public PlanExecuteAgent(String apiKey) {
-        this(apiKey, (goal, plan) -> PlanReviewDecision.execute());
+        this(new GLMClient(apiKey), (goal, plan) -> PlanReviewDecision.execute());
     }
 
-    public PlanExecuteAgent(String apiKey, PlanReviewHandler reviewHandler) {
-        this(new GLMClient(apiKey), new ToolRegistry(), null, new ArrayList<>(), null, reviewHandler);
+    public PlanExecuteAgent(LlmClient llmClient) {
+        this(llmClient, (goal, plan) -> PlanReviewDecision.execute());
+    }
+
+    public PlanExecuteAgent(LlmClient llmClient, PlanReviewHandler reviewHandler) {
+        this(llmClient, new ToolRegistry(), null, new ArrayList<>(), null, reviewHandler);
     }
 
     /**
      * 共享上下文构造器：注入会话级 sharedHistory 与 MemoryManager，
      * 让 Plan 与 ReAct 共享同一份对话记忆与长期记忆。
      */
-    public PlanExecuteAgent(String apiKey, PlanReviewHandler reviewHandler,
-                            List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
-        this(new GLMClient(apiKey), new ToolRegistry(), null, sharedHistory, sharedMemory, reviewHandler);
+    public PlanExecuteAgent(LlmClient llmClient, PlanReviewHandler reviewHandler,
+                            List<LlmClient.Message> sharedHistory, MemoryManager sharedMemory) {
+        this(llmClient, new ToolRegistry(), null, sharedHistory, sharedMemory, reviewHandler);
     }
 
     /**
      * 共享上下文 + 自定义 ToolRegistry 构造器：允许注入 HitlToolRegistry，
      * 让 Plan 模式下的工具调用也走 HITL 审批。
      */
-    public PlanExecuteAgent(String apiKey, ToolRegistry toolRegistry,
+    public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry,
                             PlanReviewHandler reviewHandler,
-                            List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
-        this(new GLMClient(apiKey), toolRegistry, null, sharedHistory, sharedMemory, reviewHandler);
+                            List<LlmClient.Message> sharedHistory, MemoryManager sharedMemory) {
+        this(llmClient, toolRegistry, null, sharedHistory, sharedMemory, reviewHandler);
     }
 
-    PlanExecuteAgent(GLMClient llmClient, ToolRegistry toolRegistry, Planner planner,
-                     List<GLMClient.Message> sharedHistory, MemoryManager memoryManager,
+    PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry, Planner planner,
+                     List<LlmClient.Message> sharedHistory, MemoryManager memoryManager,
                      PlanReviewHandler reviewHandler) {
         this.llmClient = llmClient;
         this.toolRegistry = toolRegistry != null ? toolRegistry : new ToolRegistry();
@@ -205,18 +210,18 @@ public class PlanExecuteAgent {
         // 默认提取前 8 条，可通过参数调整
         String priorContext = buildPriorContext(sharedHistory, 8);
         // 添加本轮用户消息
-        sharedHistory.add(GLMClient.Message.user(userInput));
+        sharedHistory.add(LlmClient.Message.user(userInput));
 
         try {
             String result = runWithPlan(userInput, priorContext);
             if (result != null && !result.isBlank()) {
-                sharedHistory.add(GLMClient.Message.assistant(result));
+                sharedHistory.add(LlmClient.Message.assistant(result));
             }
             return result;
         } catch (Exception e) {
             log.error("Plan run failed", e);
             String errorMessage = "❌ 执行失败: " + e.getMessage();
-            sharedHistory.add(GLMClient.Message.assistant(errorMessage));
+            sharedHistory.add(LlmClient.Message.assistant(errorMessage));
             return errorMessage;
         }
     }
@@ -225,14 +230,14 @@ public class PlanExecuteAgent {
      * 从共享历史取最近 maxMessages 条（跳过 index 0 的 system prompt），
      * 格式化为 "role: content" 供规划时参考。压缩摘要若落在窗口内自然被包含。
      */
-    private String buildPriorContext(List<GLMClient.Message> history, int maxMessages) {
+    private String buildPriorContext(List<LlmClient.Message> history, int maxMessages) {
         if (history.size() <= 1) {
             return "";
         }
         int start = Math.max(1, history.size() - maxMessages);
         StringBuilder sb = new StringBuilder();
         for (int i = start; i < history.size(); i++) {
-            GLMClient.Message m = history.get(i);
+            LlmClient.Message m = history.get(i);
             sb.append(m.role()).append(": ").append(m.content()).append("\n");
         }
         return sb.toString();
@@ -409,11 +414,11 @@ public class PlanExecuteAgent {
      * 工具中间结果不纳入（事实提取的噪声），只取任务最终产出。
      */
     private void extractFactsFromPlan(ExecutionPlan plan) {
-        List<GLMClient.Message> sessionHistory = new ArrayList<>();
-        sessionHistory.add(GLMClient.Message.user(plan.getGoal()));
+        List<LlmClient.Message> sessionHistory = new ArrayList<>();
+        sessionHistory.add(LlmClient.Message.user(plan.getGoal()));
         for (Task t : plan.getAllTasks()) {
             if (t.getResult() != null && !t.getResult().isBlank()) {
-                sessionHistory.add(GLMClient.Message.assistant("[" + t.getId() + "] " + t.getResult()));
+                sessionHistory.add(LlmClient.Message.assistant("[" + t.getId() + "] " + t.getResult()));
             }
         }
         memoryManager.extractAndSaveFacts(sessionHistory);
@@ -571,9 +576,9 @@ public class PlanExecuteAgent {
             taskInput = taskInput + "\n\n" + memoryContext;
         }
 
-        List<GLMClient.Message> messages = new ArrayList<>(Arrays.asList(
-                GLMClient.Message.system(prompt),
-                GLMClient.Message.user(taskInput)
+        List<LlmClient.Message> messages = new ArrayList<>(Arrays.asList(
+                LlmClient.Message.system(prompt),
+                LlmClient.Message.user(taskInput)
         ));
 
         StringBuilder allResults = new StringBuilder();
@@ -583,7 +588,7 @@ public class PlanExecuteAgent {
         while (iteration < MAX_TASK_ITERATIONS) {
             iteration++;
 
-            GLMClient.ChatResponse response = llmClient.chat(
+            LlmClient.ChatResponse response = llmClient.chat(
                     messages,
                     toolRegistry.getToolDefinitions(),
                     streamRenderer
@@ -614,7 +619,7 @@ public class PlanExecuteAgent {
 
             // 有工具调用：执行工具并将结果回灌到消息历史
             printToolCalls(out, response.toolCalls());
-            messages.add(GLMClient.Message.assistant(
+            messages.add(LlmClient.Message.assistant(
                     response.reasoningContent(),
                     response.content(),
                     response.toolCalls()
@@ -627,7 +632,7 @@ public class PlanExecuteAgent {
             List<ToolExecutionResult> toolResults = executeToolCalls(task.getId(), response.toolCalls());
             for (ToolExecutionResult toolResult : toolResults) {
                 allResults.append(toolResult.result()).append("\n");
-                messages.add(GLMClient.Message.tool(toolResult.id(), toolResult.result()));
+                messages.add(LlmClient.Message.tool(toolResult.id(), toolResult.result()));
             }
         }
 
@@ -719,11 +724,11 @@ public class PlanExecuteAgent {
         System.out.println("💡 简单任务，直接执行...\n");
 
         // 复用第1期的ReAct逻辑
-        List<GLMClient.Message> messages = new ArrayList<>();
-        messages.add(GLMClient.Message.system("你是一个智能编程助手，可以调用工具完成任务。"));
-        messages.add(GLMClient.Message.user(userInput));
+        List<LlmClient.Message> messages = new ArrayList<>();
+        messages.add(LlmClient.Message.system("你是一个智能编程助手，可以调用工具完成任务。"));
+        messages.add(LlmClient.Message.user(userInput));
 
-        GLMClient.ChatResponse response = llmClient.chat(
+        LlmClient.ChatResponse response = llmClient.chat(
                 messages,
                 toolRegistry.getToolDefinitions()
         );
@@ -731,7 +736,7 @@ public class PlanExecuteAgent {
         if (response.hasToolCalls()) {
             StringBuilder results = new StringBuilder();
 
-            for (GLMClient.ToolCall toolCall : response.toolCalls()) {
+            for (LlmClient.ToolCall toolCall : response.toolCalls()) {
                 String toolResult = toolRegistry.executeTool(
                         toolCall.function().name(),
                         toolCall.function().arguments()
@@ -763,9 +768,9 @@ public class PlanExecuteAgent {
         return normalized.substring(0, maxLength) + "...";
     }
 
-    private List<ToolExecutionResult> executeToolCalls(String taskId, List<GLMClient.ToolCall> toolCalls) {
+    private List<ToolExecutionResult> executeToolCalls(String taskId, List<LlmClient.ToolCall> toolCalls) {
         List<ToolInvocation> invocations = new ArrayList<>();
-        for (GLMClient.ToolCall toolCall : toolCalls) {
+        for (LlmClient.ToolCall toolCall : toolCalls) {
             String toolName = toolCall.function().name();
             String toolArgs = toolCall.function().arguments();
             log.info("Task {} scheduling tool {}", taskId, toolName);
@@ -783,16 +788,16 @@ public class PlanExecuteAgent {
         return results;
     }
 
-    private static void printToolCalls(PrintStream out, List<GLMClient.ToolCall> toolCalls) {
-        Map<String, List<GLMClient.ToolCall>> grouped = new LinkedHashMap<>();
-        for (GLMClient.ToolCall tc : toolCalls) {
+    private static void printToolCalls(PrintStream out, List<LlmClient.ToolCall> toolCalls) {
+        Map<String, List<LlmClient.ToolCall>> grouped = new LinkedHashMap<>();
+        for (LlmClient.ToolCall tc : toolCalls) {
             grouped.computeIfAbsent(tc.function().name(), k -> new ArrayList<>()).add(tc);
         }
         for (var group : grouped.entrySet()) {
             String toolName = group.getKey();
-            List<GLMClient.ToolCall> calls = group.getValue();
+            List<LlmClient.ToolCall> calls = group.getValue();
             out.println(AnsiStyle.subtle("  " + toolLabel(toolName, calls.size())));
-            for (GLMClient.ToolCall tc : calls) {
+            for (LlmClient.ToolCall tc : calls) {
                 String detail = extractKeyParam(toolName, tc.function().arguments());
                 if (!detail.isEmpty()) {
                     out.println(AnsiStyle.subtle("    └ " + detail));
@@ -856,7 +861,7 @@ public class PlanExecuteAgent {
      * 单任务的流式渲染器 —— 将 LLM 返回的 reasoning/content delta
      * 实时以 Markdown 格式打印到终端，并通知 StreamState。
      */
-    private static final class TaskStreamRenderer implements GLMClient.StreamListener {
+    private static final class TaskStreamRenderer implements LlmClient.StreamListener {
         private final String taskId;
         private final StreamState streamState;
         private final PrintStream out;

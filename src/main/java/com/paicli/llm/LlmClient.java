@@ -1,0 +1,109 @@
+package com.paicli.llm;
+
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.io.IOException;
+import java.util.List;
+
+/**
+ * LLM 客户端接口，定义所有 Agent 依赖的契约。
+ * <p>
+ * 具体实现（GLMClient、DeepSeekClient 等）通过 {@link AbstractOpenAiCompatibleClient} 基类
+ * 共享 HTTP 请求构建和 SSE 流式解析逻辑，只需提供 API URL、模型名和 API Key。
+ */
+public interface LlmClient {
+
+    /**
+     * 发送聊天请求（不含流式监听）
+     */
+    ChatResponse chat(List<Message> messages, List<Tool> tools) throws IOException;
+
+    /**
+     * 发送聊天请求（含流式监听），通过 listener 持续回调 reasoning/content 增量
+     */
+    ChatResponse chat(List<Message> messages, List<Tool> tools, StreamListener listener) throws IOException;
+
+    /** 当前使用的模型名称，如 "glm-4.7" */
+    String getModelName();
+
+    /** 当前 provider 名称，如 "glm"、"deepseek" */
+    String getProviderName();
+
+    // ── 数据模型 ──
+
+    /**
+     * 对话消息，对应请求体中 messages 数组的一项
+     */
+    record Message(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
+                   String toolCallId) {
+        public Message(String role, String content) {
+            this(role, content, null, null, null);
+        }
+
+        public static Message system(String content) {
+            return new Message("system", content);
+        }
+
+        public static Message user(String content) {
+            return new Message("user", content);
+        }
+
+        public static Message assistant(String content) {
+            return new Message("assistant", content);
+        }
+
+        public static Message assistant(String reasoningContent, String content) {
+            return new Message("assistant", content, reasoningContent, null, null);
+        }
+
+        public static Message assistant(String content, List<ToolCall> toolCalls) {
+            return new Message("assistant", content, null, toolCalls, null);
+        }
+
+        public static Message assistant(String reasoningContent, String content, List<ToolCall> toolCalls) {
+            return new Message("assistant", content, reasoningContent, toolCalls, null);
+        }
+
+        public static Message tool(String toolCallId, String content) {
+            return new Message("tool", content, null, null, toolCallId);
+        }
+    }
+
+    /**
+     * 工具调用记录
+     */
+    record ToolCall(String id, Function function) {
+        public record Function(String name, String arguments) {}
+    }
+
+    /**
+     * 工具定义
+     */
+    record Tool(String name, String description, JsonNode parameters) {}
+
+    /**
+     * 流式输出监听器
+     */
+    interface StreamListener {
+        StreamListener NO_OP = new StreamListener() {};
+
+        default void onReasoningDelta(String delta) {}
+
+        default void onContentDelta(String delta) {}
+    }
+
+    /**
+     * 模型响应
+     */
+    record ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
+                        int inputTokens, int outputTokens) {
+        public ChatResponse(String role, String content, List<ToolCall> toolCalls,
+                            int inputTokens, int outputTokens) {
+            this(role, content, null, toolCalls, inputTokens, outputTokens);
+        }
+
+        public boolean hasToolCalls() {
+            return toolCalls != null && !toolCalls.isEmpty();
+        }
+    }
+}

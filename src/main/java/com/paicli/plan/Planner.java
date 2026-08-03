@@ -2,7 +2,7 @@ package com.paicli.plan;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.paicli.llm.GLMClient;
+import com.paicli.llm.LlmClient;
 import com.paicli.util.AnsiStyle;
 import com.paicli.util.TerminalMarkdownRenderer;
 
@@ -29,7 +29,7 @@ import java.util.*;
  * 按什么顺序输出都不会出错。
  */
 public class Planner {
-    private final GLMClient llmClient;
+    private final LlmClient llmClient;
     private final ObjectMapper mapper = new ObjectMapper();
 
     // 规划提示词
@@ -75,7 +75,7 @@ public class Planner {
             只输出JSON，不要有其他内容。
             """;
 
-    public Planner(GLMClient llmClient) {
+    public Planner(LlmClient llmClient) {
         this.llmClient = llmClient;
     }
 
@@ -119,14 +119,14 @@ public class Planner {
             userContent = "【先前对话上下文】\n" + priorContext + "\n\n请参考上下文，为以下任务制定执行计划：\n" + goal;
         }
 
-        List<GLMClient.Message> messages = Arrays.asList(
-                GLMClient.Message.system(PLANNING_PROMPT),
-                GLMClient.Message.user(userContent)
+        List<LlmClient.Message> messages = Arrays.asList(
+                LlmClient.Message.system(PLANNING_PROMPT),
+                LlmClient.Message.user(userContent)
         );
 
         // 调用LLM生成计划
         PlanningStreamRenderer streamRenderer = new PlanningStreamRenderer();
-        GLMClient.ChatResponse response = llmClient.chat(messages, null, streamRenderer);
+        LlmClient.ChatResponse response = llmClient.chat(messages, null, streamRenderer);
         streamRenderer.finish();
         String planJson = response.content();
 
@@ -359,7 +359,7 @@ public class Planner {
     /**
      * 规划流式渲染器。
      */
-    private static final class PlanningStreamRenderer implements GLMClient.StreamListener {
+    private static final class PlanningStreamRenderer implements LlmClient.StreamListener {
         private TerminalMarkdownRenderer reasoningRenderer;
         private boolean reasoningStarted;
         private boolean streamed;

@@ -1,6 +1,6 @@
 package com.paicli.agent;
 
-import com.paicli.llm.GLMClient;
+import com.paicli.llm.LlmClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
@@ -22,9 +22,9 @@ import java.util.Map;
 public class Agent {
 
     private static final Logger log = LoggerFactory.getLogger(Agent.class);
-    private final GLMClient llmClient;
+    private LlmClient llmClient;
     private final ToolRegistry toolRegistry;
-    private final List<GLMClient.Message> conversationHistory;
+    private final List<LlmClient.Message> conversationHistory;
     private final MemoryManager memoryManager;
     private static final int MAX_ITERATIONS = 10;
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
@@ -58,33 +58,41 @@ public class Agent {
             请用中文回复用户。
             """;
 
-    public Agent(String apiKey) {
-        this(apiKey, new ArrayList<>(), new MemoryManager(new GLMClient(apiKey)));
+    public Agent(LlmClient llmClient) {
+        this(llmClient, new ArrayList<>(), new MemoryManager(llmClient));
     }
 
     /**
      * 共享上下文构造器：注入会话级 conversationHistory 与 MemoryManager，
      * 让 ReAct 与 Plan 模式共享同一份对话记忆与长期记忆。
      */
-    public Agent(String apiKey, List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
-        this(apiKey, sharedHistory, sharedMemory, new ToolRegistry());
+    public Agent(LlmClient llmClient, List<LlmClient.Message> sharedHistory, MemoryManager sharedMemory) {
+        this(llmClient, sharedHistory, sharedMemory, new ToolRegistry());
     }
 
     /**
      * 共享上下文 + 自定义 ToolRegistry 构造器：允许注入 HitlToolRegistry，
      * 在危险工具调用前插入人工审批。
      */
-    public Agent(String apiKey, List<GLMClient.Message> sharedHistory,
+    public Agent(LlmClient llmClient, List<LlmClient.Message> sharedHistory,
                  MemoryManager sharedMemory, ToolRegistry toolRegistry) {
-        this.llmClient = new GLMClient(apiKey);
+        this.llmClient = llmClient;
         this.toolRegistry = toolRegistry;
         this.conversationHistory = sharedHistory;
         this.memoryManager = sharedMemory;
 
         // 保证 index 0 是 system prompt（供 Plan 后续追加、压缩保留 index 0）
         if (conversationHistory.isEmpty()) {
-            conversationHistory.add(GLMClient.Message.system(SYSTEM_PROMPT));
+            conversationHistory.add(LlmClient.Message.system(SYSTEM_PROMPT));
         }
+    }
+
+    /**
+     * 更新 LLM 客户端（用于运行时模型切换），同步更新关联的 MemoryManager。
+     */
+    public void setLlmClient(LlmClient llmClient) {
+        this.llmClient = llmClient;
+        this.memoryManager.setLlmClient(llmClient);
     }
 
     /**
@@ -97,7 +105,7 @@ public class Agent {
         updateSystemPromptWithMemory(memoryContext);
 
         // 添加用户输入到历史（保持原文，不污染 user message）
-        conversationHistory.add(GLMClient.Message.user(userInput));
+        conversationHistory.add(LlmClient.Message.user(userInput));
 
         System.out.println("🤔 思考中...\n");
 
@@ -105,6 +113,10 @@ public class Agent {
         StringBuilder reasoningTranscript = new StringBuilder();
 
         StreamRenderer streamRenderer = new StreamRenderer();
+
+        long startNanos = System.nanoTime();
+        int totalInputTokens = 0;
+        int totalOutputTokens = 0;
 
         int iteration = 0;
         while (iteration < MAX_ITERATIONS) {
@@ -115,14 +127,14 @@ public class Agent {
                 memoryManager.compressContextIfNeeded(conversationHistory);
 
                 // 调用 LLM
-                GLMClient.ChatResponse response = llmClient.chat(
+                LlmClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
                         toolRegistry.getToolDefinitions(),
                         streamRenderer
                 );
 
-                // 记录本次调用的 token 使用（覆盖工具调用与最终响应两条分支）
-                memoryManager.recordTokenUsage(response.inputTokens(), response.outputTokens());
+                totalInputTokens += response.inputTokens();
+                totalOutputTokens += response.outputTokens();
 
                 // 如果有工具调用
                 if (response.hasToolCalls()) {
@@ -130,7 +142,7 @@ public class Agent {
                     log.info("LLM requested {} tool call(s) in iteration {}", response.toolCalls().size(), iteration);
                     printToolCalls(System.out, response.toolCalls());
                     // 添加助手消息（包含工具调用）
-                    conversationHistory.add(GLMClient.Message.assistant(
+                    conversationHistory.add(LlmClient.Message.assistant(
                             response.reasoningContent(),
                             response.content(),
                             response.toolCalls()
@@ -143,7 +155,7 @@ public class Agent {
 
                     List<ToolExecutionResult> toolResults = executeToolCalls(response.toolCalls(), iteration);
                     for (ToolExecutionResult toolResult : toolResults) {
-                        conversationHistory.add(GLMClient.Message.tool(toolResult.id(), toolResult.result()));
+                        conversationHistory.add(LlmClient.Message.tool(toolResult.id(), toolResult.result()));
                     }
 
                     // 继续循环，让 LLM 根据工具结果继续思考
@@ -152,10 +164,13 @@ public class Agent {
                 } else {
                     // 没有工具调用，直接返回结果
                     appendReasoning(reasoningTranscript, response.reasoningContent());
-                    conversationHistory.add(GLMClient.Message.assistant(
+                    conversationHistory.add(LlmClient.Message.assistant(
                             response.reasoningContent(),
                             response.content()
                     ));
+
+                    // 记录累计 token 使用
+                    memoryManager.recordTokenUsage(totalInputTokens, totalOutputTokens);
 
                     // 先刷出缓冲区残留文本，确保在 token 统计之前全部可见
                     boolean wasStreamed = streamRenderer.hasStreamedOutput();
@@ -163,13 +178,11 @@ public class Agent {
                         streamRenderer.finish();
                     }
 
-                    // 打印 token 使用情况
-                    System.out.printf("📊 Token使用: 输入=%d, 输出=%d%n\n",
-                            response.inputTokens(), response.outputTokens());
+                    String statsLine = formatTokenStats(totalInputTokens, totalOutputTokens, startNanos);
 
                     log.info("ReAct run finished: inputTokens={}, outputTokens={}, reasoningChars={}, answerChars={}",
-                            response.inputTokens(),
-                            response.outputTokens(),
+                            totalInputTokens,
+                            totalOutputTokens,
                             response.reasoningContent() == null ? 0 : response.reasoningContent().length(),
                             response.content() == null ? 0 : response.content().length());
                     if (log.isDebugEnabled()) {
@@ -177,10 +190,12 @@ public class Agent {
                     }
 
                     if (wasStreamed) {
+                        System.out.println(statsLine);
                         return "";
                     }
 
-                    return formatUserFacingResponse(reasoningTranscript.toString(), response.content());
+                    return formatUserFacingResponse(reasoningTranscript.toString(), response.content())
+                            + "\n\n" + statsLine;
                 }
 
             } catch (IOException e) {
@@ -189,8 +204,9 @@ public class Agent {
             }
         }
 
+        String statsLine = formatTokenStats(totalInputTokens, totalOutputTokens, startNanos);
         log.warn("ReAct run reached max iterations: {}", MAX_ITERATIONS);
-        return "❌ 达到最大迭代次数限制，任务未完成";
+        return "❌ 达到最大迭代次数限制，任务未完成\n\n" + statsLine;
     }
 
     /**
@@ -200,7 +216,7 @@ public class Agent {
         // 先从当前对话历史中提取关键事实
         memoryManager.extractAndSaveFacts(conversationHistory);
 
-        GLMClient.Message systemMsg = conversationHistory.get(0);
+        LlmClient.Message systemMsg = conversationHistory.get(0);
         conversationHistory.clear();
         conversationHistory.add(systemMsg);
     }
@@ -211,17 +227,17 @@ public class Agent {
     private void updateSystemPromptWithMemory(String memoryContext) {
         if (memoryContext == null || memoryContext.isEmpty()) {
             // 恢复原始 system prompt
-            conversationHistory.set(0, GLMClient.Message.system(SYSTEM_PROMPT));
+            conversationHistory.set(0, LlmClient.Message.system(SYSTEM_PROMPT));
         } else {
             String enrichedPrompt = SYSTEM_PROMPT + "\n" + memoryContext;
-            conversationHistory.set(0, GLMClient.Message.system(enrichedPrompt));
+            conversationHistory.set(0, LlmClient.Message.system(enrichedPrompt));
         }
     }
 
     /**
      * 获取对话历史（用于调试）
      */
-    public List<GLMClient.Message> getConversationHistory() {
+    public List<LlmClient.Message> getConversationHistory() {
         return new ArrayList<>(conversationHistory);
     }
 
@@ -233,10 +249,42 @@ public class Agent {
     }
 
     /**
+     * 获取上下文状态（消息数、轮数、字符数 + 记忆状态）
+     */
+    public String getContextStatus() {
+        int systemCount = 0, userCount = 0, assistantCount = 0, toolCount = 0;
+        int totalChars = 0;
+        for (LlmClient.Message msg : conversationHistory) {
+            totalChars += msg.content() == null ? 0 : msg.content().length();
+            switch (msg.role()) {
+                case "system" -> systemCount++;
+                case "user" -> userCount++;
+                case "assistant" -> assistantCount++;
+                case "tool" -> toolCount++;
+            }
+        }
+        int totalMessages = conversationHistory.size();
+        int rounds = userCount;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("对话上下文: %d 条消息, %d 轮对话, ~%d 字符\n", totalMessages, rounds, totalChars));
+        sb.append(String.format("   system: %d / user: %d / assistant: %d / tool: %d\n", systemCount, userCount, assistantCount, toolCount));
+        sb.append(memoryManager.getSystemStatus());
+        return sb.toString();
+    }
+
+    /**
      * 获取工具注册表（用于同步项目路径等配置）
      */
     public ToolRegistry getToolRegistry() {
         return toolRegistry;
+    }
+
+    private static String formatTokenStats(int inputTokens, int outputTokens, long startNanos) {
+        double elapsedSeconds = (System.nanoTime() - startNanos) / 1_000_000_000.0;
+        return AnsiStyle.subtle(String.format(
+                "📊 Token: %d 输入 / %d 输出 / %d 合计 | ⏱ %.1fs",
+                inputTokens, outputTokens, inputTokens + outputTokens, elapsedSeconds));
     }
 
     /**
@@ -291,9 +339,9 @@ public class Agent {
         return normalized.substring(0, maxLength) + "...";
     }
 
-    private List<ToolExecutionResult> executeToolCalls(List<GLMClient.ToolCall> toolCalls, int iteration) {
+    private List<ToolExecutionResult> executeToolCalls(List<LlmClient.ToolCall> toolCalls, int iteration) {
         List<ToolInvocation> invocations = new ArrayList<>();
-        for (GLMClient.ToolCall toolCall : toolCalls) {
+        for (LlmClient.ToolCall toolCall : toolCalls) {
             String toolName = toolCall.function().name();
             String toolArgs = toolCall.function().arguments();
             log.info("Scheduling tool: {} (iteration={})", toolName, iteration);
@@ -311,16 +359,16 @@ public class Agent {
         return results;
     }
 
-    private static void printToolCalls(PrintStream out, List<GLMClient.ToolCall> toolCalls) {
-        Map<String, List<GLMClient.ToolCall>> grouped = new LinkedHashMap<>();
-        for (GLMClient.ToolCall tc : toolCalls) {
+    private static void printToolCalls(PrintStream out, List<LlmClient.ToolCall> toolCalls) {
+        Map<String, List<LlmClient.ToolCall>> grouped = new LinkedHashMap<>();
+        for (LlmClient.ToolCall tc : toolCalls) {
             grouped.computeIfAbsent(tc.function().name(), k -> new ArrayList<>()).add(tc);
         }
         for (var group : grouped.entrySet()) {
             String toolName = group.getKey();
-            List<GLMClient.ToolCall> calls = group.getValue();
+            List<LlmClient.ToolCall> calls = group.getValue();
             out.println(AnsiStyle.subtle("  " + toolLabel(toolName, calls.size())));
-            for (GLMClient.ToolCall tc : calls) {
+            for (LlmClient.ToolCall tc : calls) {
                 String detail = extractKeyParam(toolName, tc.function().arguments());
                 if (!detail.isEmpty()) {
                     out.println(AnsiStyle.subtle("    └ " + detail));
@@ -378,7 +426,7 @@ public class Agent {
      * 4. 如果 content 启动之后又收到 reasoning（服务器把思考内容追加在答案之后），
      *    缓冲到 lateReasoning，最终在 finish() 用"🧠 补充思考"标题独立展示，不会污染回复区
      */
-    private static final class StreamRenderer implements GLMClient.StreamListener {
+    private static final class StreamRenderer implements LlmClient.StreamListener {
         private final StringBuilder pendingReasoning = new StringBuilder();
         private final StringBuilder lateReasoning = new StringBuilder();
         private TerminalMarkdownRenderer reasoningRenderer;

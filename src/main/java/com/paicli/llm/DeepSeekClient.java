@@ -1,23 +1,22 @@
 package com.paicli.llm;
 
 /**
- * GLM 模型客户端（智谱 AI / bigmodel.cn）。
+ * DeepSeek API 客户端。
  * <p>
- * 继承 {@link AbstractOpenAiCompatibleClient}，复用通用的 HTTP 请求构建和 SSE 流式解析逻辑。
- * 只需提供 GLM 特有的 API 端点、模型名称和 API Key。
+ * 继承 {@link AbstractOpenAiCompatibleClient}，提供 DeepSeek 的 API 端点和默认模型。
  */
-public class GLMClient extends AbstractOpenAiCompatibleClient {
+public class DeepSeekClient extends AbstractOpenAiCompatibleClient {
 
-    private static final String API_URL = "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions";
-    private static final String DEFAULT_MODEL = "glm-4.7";
+    private static final String API_URL = "https://api.deepseek.com/chat/completions";
+    private static final String DEFAULT_MODEL = "deepseek-v4-flash";
     private final String apiKey;
     private final String model;
 
-    public GLMClient(String apiKey) {
+    public DeepSeekClient(String apiKey) {
         this(apiKey, DEFAULT_MODEL);
     }
 
-    public GLMClient(String apiKey, String model) {
+    public DeepSeekClient(String apiKey, String model) {
         this.apiKey = apiKey;
         this.model = model != null && !model.isBlank() ? model : DEFAULT_MODEL;
     }
@@ -44,6 +43,6 @@ public class GLMClient extends AbstractOpenAiCompatibleClient {
 
     @Override
     public String getProviderName() {
-        return "glm";
+        return "deepseek";
     }
 }

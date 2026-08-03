@@ -1,7 +1,7 @@
 package com.paicli.memory;
 
-import com.paicli.llm.GLMClient;
-import com.paicli.llm.GLMClient.Message;
+import com.paicli.llm.LlmClient;
+import com.paicli.llm.LlmClient.Message;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -23,7 +23,7 @@ import java.util.UUID;
  * 二者只在 extractFacts 处单向衔接：Message → 事实文本 → MemoryEntry。
  */
 public class ContextCompressor {
-    private final GLMClient llmClient;
+    private LlmClient llmClient;
     // 保留最近 N 轮完整消息不压缩
     private final int retainRecentRounds;
 
@@ -82,7 +82,11 @@ public class ContextCompressor {
             "版本", "模型", "接口", "配置", "环境变量", "命令", "约定", "规则", "默认"
     );
 
-    public ContextCompressor(GLMClient llmClient) {
+    public void setLlmClient(LlmClient llmClient) {
+        this.llmClient = llmClient;
+    }
+
+    public ContextCompressor(LlmClient llmClient) {
         this(llmClient, 3);
     }
 
@@ -90,7 +94,7 @@ public class ContextCompressor {
      * @param llmClient          LLM 客户端
      * @param retainRecentRounds 保留最近 N 轮完整消息不压缩
      */
-    public ContextCompressor(GLMClient llmClient, int retainRecentRounds) {
+    public ContextCompressor(LlmClient llmClient, int retainRecentRounds) {
         this.llmClient = llmClient;
         this.retainRecentRounds = retainRecentRounds;
     }
@@ -168,12 +172,12 @@ public class ContextCompressor {
 
         try {
             String prompt = String.format(EXTRACT_FACTS_PROMPT, conversation);
-            List<GLMClient.Message> messages = List.of(
-                    GLMClient.Message.system("你是一个信息提取助手，只输出关键事实，不输出其他内容。"),
-                    GLMClient.Message.user(prompt)
+            List<LlmClient.Message> messages = List.of(
+                    LlmClient.Message.system("你是一个信息提取助手，只输出关键事实，不输出其他内容。"),
+                    LlmClient.Message.user(prompt)
             );
 
-            GLMClient.ChatResponse response = llmClient.chat(messages, null);
+            LlmClient.ChatResponse response = llmClient.chat(messages, null);
             String factsText = response.content();
 
             List<String> facts = new ArrayList<>();
@@ -220,12 +224,12 @@ public class ContextCompressor {
             // 将本组拼接好的分片交给 AI 生成摘要
             try {
                 String prompt = String.format(MAP_PROMPT, chunkText);
-                List<GLMClient.Message> messages = List.of(
-                        GLMClient.Message.system("你是一个对话摘要助手。"),
-                        GLMClient.Message.user(prompt)
+                List<LlmClient.Message> messages = List.of(
+                        LlmClient.Message.system("你是一个对话摘要助手。"),
+                        LlmClient.Message.user(prompt)
                 );
 
-                GLMClient.ChatResponse response = llmClient.chat(messages, null);
+                LlmClient.ChatResponse response = llmClient.chat(messages, null);
                 // 将本组的摘要添加到 summaries 中
                 summaries.add(response.content());
             } catch (IOException e) {
@@ -247,12 +251,12 @@ public class ContextCompressor {
 
         try {
             String prompt = String.format(REDUCE_PROMPT, joined);
-            List<GLMClient.Message> messages = List.of(
-                    GLMClient.Message.system("你是一个摘要合并助手。"),
-                    GLMClient.Message.user(prompt)
+            List<LlmClient.Message> messages = List.of(
+                    LlmClient.Message.system("你是一个摘要合并助手。"),
+                    LlmClient.Message.user(prompt)
             );
 
-            GLMClient.ChatResponse response = llmClient.chat(messages, null);
+            LlmClient.ChatResponse response = llmClient.chat(messages, null);
             return response.content();
         } catch (IOException e) {
             System.err.println("⚠️ 摘要合并失败: " + e.getMessage());
