@@ -419,7 +419,7 @@ public class AgentOrchestrator {
         });
         BlockingQueue<SubAgent> workerPool = new LinkedBlockingQueue<>(workers);
         Map<String, ByteArrayOutputStream> buffers = new ConcurrentHashMap<>();
-        List<Future<?>> futures = new ArrayList<>();
+        CompletionService<String> completionService = new ExecutorCompletionService<>(executor);
 
         for (ExecutionStep step : batch) {
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -427,7 +427,7 @@ public class AgentOrchestrator {
             PrintStream stepOut = new PrintStream(baos, true, StandardCharsets.UTF_8);
             String context = buildStepContext(steps, step);
 
-            futures.add(executor.submit(() -> {
+            completionService.submit(() -> {
                 SubAgent worker = null;
                 SubAgent localReviewer = new SubAgent(
                         "reviewer-" + step.id(), AgentRole.REVIEWER, llmClient, toolRegistry);
@@ -449,30 +449,41 @@ public class AgentOrchestrator {
                     }
                     stepOut.flush();
                 }
-                return null;
-            }));
+                return step.id();
+            });
         }
 
-        for (Future<?> f : futures) {
+        // 按完成顺序收集结果，但按提交顺序 flush 输出：
+        // 当某个 step 完成时，如果它前面的 step 也都已完成，则连续 flush 直到遇到未完成的。
+        int nextToFlush = 0;
+        Set<String> completedIds = new HashSet<>();
+
+        for (int i = 0; i < batch.size(); i++) {
             try {
-                f.get();
+                String completedStepId = completionService.take().get();
+                completedIds.add(completedStepId);
+
+                while (nextToFlush < batch.size()) {
+                    ExecutionStep pending = batch.get(nextToFlush);
+                    if (completedIds.contains(pending.id())) {
+                        ByteArrayOutputStream buf = buffers.get(pending.id());
+                        if (buf != null && buf.size() > 0) {
+                            System.out.print(buf.toString(StandardCharsets.UTF_8));
+                            System.out.flush();
+                        }
+                        nextToFlush++;
+                    } else {
+                        break;
+                    }
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                log.warn("Batch wait interrupted");
+                log.warn("Batch wait interrupted at step {}/{}", i + 1, batch.size());
             } catch (ExecutionException e) {
                 log.error("Parallel step task failed", e.getCause());
             }
         }
-        executor.shutdown();
-
-        // 按 step_id 顺序 flush 各步骤的缓冲输出，保证用户看到的执行过程有稳定顺序
-        for (ExecutionStep step : batch) {
-            ByteArrayOutputStream buf = buffers.get(step.id());
-            if (buf != null && buf.size() > 0) {
-                System.out.print(buf.toString(StandardCharsets.UTF_8));
-                System.out.flush();
-            }
-        }
+        executor.shutdownNow();
     }
 
     /**

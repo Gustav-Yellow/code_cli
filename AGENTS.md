@@ -15,7 +15,7 @@
 - **核心依赖**：OkHttp 4.12（HTTP）、Jackson 2.16（JSON）、Logback 1.5（日志）、JLine 3.26（终端）、jieba-analysis 1.0.2（中文分词）、sqlite-jdbc 3.49（SQLite）、javaparser-core 3.28（AST 解析）
 - **默认 LLM**：智谱 GLM-5.2（`https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），OpenAI 兼容协议
 - **入口类**：`com.paicli.cli.Main`
-- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7–21 期见 ROADMAP.md
+- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7 期（异步并行工具执行）已完成并文档化（`docs/Chapter7-Async_Parallel实现.md`）；第 8–21 期见 ROADMAP.md
 
 设计哲学：**手写优先，框架在后**。21 期主线全部手写完成后，才会开启 Pro 分支用 Spring AI / LangGraph4J 重构做对照实现。日常开发不要提前引入 Spring / LangChain4j 等框架抽象。
 
@@ -37,6 +37,7 @@ paicli/
 │   ├── chapter4.1-Streaming_and_Log实现.md
 │   └── chapter5-Multi_Agent开发.md
 │   └── Chapter6-HITL实现.md
+│   └── Chapter7-Async_Parallel实现.md
 └── src/main/java/com/paicli/
     ├── cli/
     │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令
@@ -440,6 +441,34 @@ paicli/
 - 注意：`pom.xml` 中已删除 `slf4j-simple`，确保 logback 为唯一 SLF4J binding
 - 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 8 节
 
+### 4.14 `tool.ToolRegistry` — 第 7 期增强（异步并行工具执行）
+
+- 文件：`src/main/java/com/paicli/tool/ToolRegistry.java`、`src/main/java/com/paicli/agent/Agent.java`、`src/main/java/com/paicli/agent/PlanExecuteAgent.java`、`src/main/java/com/paicli/agent/SubAgent.java`
+- **新增类型**：
+  - `ToolInvocation` record：工具调用请求模型 `(id, name, argumentsJson)`
+  - `ToolExecutionResult` record：工具执行结果模型 `(id, name, argumentsJson, result, elapsedMillis, timedOut)`
+- **核心方法**：
+  - `ToolRegistry.executeTools(List<ToolInvocation>)`：同一轮 LLM 返回多个 `tool_calls` 时并行执行。单调用走原 `executeTool()`，多调用走 daemon 线程池（最多 4 线程），使用 `invokeAll` + 批次超时（默认 90 秒）。超时工具会被取消并返回可回灌的超时结果。
+- **Agent / PlanExecuteAgent / SubAgent 集成**：
+  - 各 Agent 新增 `executeToolCalls()` 方法：将 LLM 返回的 `toolCalls` 转为 `List<ToolInvocation>`，调 `toolRegistry.executeTools()`，结果按原顺序回灌到对话历史。
+  - 新增 `printToolCalls()` / `toolLabel()` / `extractKeyParam()`：按工具名分组打印紧凑的工具调用摘要（📖 读取 N 个文件 / ⚡ 执行 N 条命令等），替代原先逐条打印 `🔧 执行工具: xxx` 的冗长输出。
+- **PlanExecuteAgent 增强**：
+  - `executeTask()` 新增 `PrintStream out` 参数，`executeTaskBatch()` 并行任务使用 `Map<String, ByteArrayOutputStream>` + 独立 `PrintStream` 缓冲，批次完成后按 Task ID 顺序 flush 到 stdout，避免多线程写 `System.out` 造成输出交错。
+  - `TaskStreamRenderer` 重构：新增 `pendingReasoning` 缓冲区（防空白标题）、`lateReasoning` 收集（防 content 开始后追加的 reasoning 丢失）、`flushLateReasoning()` 独立展示补充思考、标签从「任务结果」改为「任务输出」（避免 tool-call 前的叙述被误标为最终结果）。
+- **Agent.StreamRenderer 增强**：
+  - 新增 `reasoningHeadingPrinted` 标记：同一次 ReAct 运行中只打印一次「🧠 思考过程」标题，工具调用前后的 reasoning 归在同一块下。
+  - 新增 `containsLineBreak()` 检查：pending reasoning 不含换行时暂不触发标题，避免空白标题。
+  - 新增 `flushPendingReasoning()` / `printReasoningHeadingIfNeeded()`：在 `resetBetweenIterations()` / `finish()` 中统一刷出 pending 文本。
+- **Prompts 增强**：
+  - ReAct `SYSTEM_PROMPT`、Plan `EXECUTION_PROMPT`、SubAgent `WORKER_PROMPT` 均新增"同一轮返回多个工具调用时系统会并行执行"的提示，并给出同时读取多个文件的示例。
+  - SubAgent `PLANNER_PROMPT` 新增规则 7-8：鼓励无依赖步骤（让编排器能并行分配），只有真正需要前一步结果时才写 dependencies。
+- **其他改动**：
+  - `AgentOrchestrator` 并行执行器 `shutdown()` → `shutdownNow()`。
+  - `pom.xml` 新增 `maven-surefire-plugin` 3.2.5 + UTF-8 `argLine`。
+  - CLI 版本号 6.0.0 → 7.0.0，banner `"HITL Approval CLI"` → `"Async Tool CLI"`。
+- **HITL 兼容**：`HitlToolRegistry` 继承 `ToolRegistry`，`executeTools()` 自动获得 HITL 拦截能力，无需额外适配。
+- 详见 `docs/Chapter7-Async_Parallel实现.md`
+
 ---
 
 ## 5. 开发与运行
@@ -467,7 +496,7 @@ java -jar target/paicli-0.0.1-SNAPSHOT.jar
 
 ### 5.3 测试
 
-当前还没有单元测试。ROADMAP 中后续期次会引入 `mvn test`。第 6 期将实现危险操作（write_file / execute_command / create_project）的 HITL 审批，第 2 期已实现计划生成的 HITL 审查。
+`mvn test` 使用 `maven-surefire-plugin` 3.2.5（UTF-8 编码）。当前有少量单元测试，后续期次逐步补充。
 
 ---
 
@@ -479,7 +508,7 @@ java -jar target/paicli-0.0.1-SNAPSHOT.jar
 | 4 | RAG 检索 | `VectorStore` / `CodeIndex` / `CodeChunker` / `CodeAnalyzer` / `EmbeddingClient` / `CodeRetriever` | 已完成 → [4.10](#410-rag-包--rag-代码检索第-4-期) + `docs/chapter4-RAG开发.md` |
 | 5 | Multi-Agent | `AgentOrchestrator` / `SubAgent` / `AgentRole` / `AgentMessage` | 已完成 → [4.5b–4.5e](#45b-agentagentorchestrator--multi-agent-编排器第-5-期新增) + `docs/chapter5-Multi_Agent开发.md` |
 | 6 | HITL 审批 | `HitlToolRegistry` / `ApprovalPolicy` / `ApprovalRequest` / `ApprovalResult` / `HitlHandler` / `TerminalHitlHandler` | 已完成 → [4.12](#412-hitl-包--hitl-审批系统第-6-期) |
-| 7 | 异步并行 | `BatchToolExecutor` | 部分实现（第 2 期已有分批并行执行，第 7 期补充更高级的异步调度） |
+| 7 | 异步并行 | `ToolRegistry.executeTools` / `ToolInvocation` / `ToolExecutionResult` | 已完成 → [4.14](#414-toolregistry-第-7-期增强) |
 | 8 | 多模型 | `LlmClient` 接口 / `AbstractOpenAiCompatibleClient` / `DeepSeekClient` / `StepClient` / `KimiClient` | 未开始 |
 | 9 | 联网工具 | `web_search` / `web_fetch` | 未开始 |
 | 10–11 | MCP | `JsonRpcClient` / `McpTransport` / `McpServerManager` | 未开始 |

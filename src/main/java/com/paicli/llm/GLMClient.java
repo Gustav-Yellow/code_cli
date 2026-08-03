@@ -20,7 +20,7 @@ import java.util.concurrent.TimeUnit;
  */
 public class GLMClient {
     private static final String API_URL = "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions";
-    private static final String MODEL = "glm-5.2";
+    private static final String MODEL = "glm-4.7";
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final OkHttpClient SHARED_HTTP_CLIENT = new OkHttpClient.Builder()
             .connectTimeout(60, TimeUnit.SECONDS)
