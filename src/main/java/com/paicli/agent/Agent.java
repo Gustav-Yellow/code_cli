@@ -57,8 +57,17 @@ public class Agent {
      * 让 ReAct 与 Plan 模式共享同一份对话记忆与长期记忆。
      */
     public Agent(String apiKey, List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
+        this(apiKey, sharedHistory, sharedMemory, new ToolRegistry());
+    }
+
+    /**
+     * 共享上下文 + 自定义 ToolRegistry 构造器：允许注入 HitlToolRegistry，
+     * 在危险工具调用前插入人工审批。
+     */
+    public Agent(String apiKey, List<GLMClient.Message> sharedHistory,
+                 MemoryManager sharedMemory, ToolRegistry toolRegistry) {
         this.llmClient = new GLMClient(apiKey);
-        this.toolRegistry = new ToolRegistry();
+        this.toolRegistry = toolRegistry;
         this.conversationHistory = sharedHistory;
         this.memoryManager = sharedMemory;
 
@@ -116,8 +125,10 @@ public class Agent {
                             response.toolCalls()
                     ));
 
-                    // 刷出缓冲区中的中间文本，确保在工具调用日志之前可见
-                    streamRenderer.flushPending();
+                    // 在工具执行前 flush 并重置流式渲染器，避免 TerminalMarkdownRenderer
+                    // 内部 pending 缓冲区（仅按换行 flush）里的文本被 HITL 提示"跨过"
+                    // 造成标题和内容错位。重置后下一轮迭代的 reasoning/content 会重新打印标题。
+                    streamRenderer.resetBetweenIterations();
 
                     // 执行每个工具调用
                     for (GLMClient.ToolCall toolCall : response.toolCalls()) {
@@ -275,7 +286,7 @@ public class Agent {
         }
 
         // 都不为空的情况下 返回推理内容和回答内容
-        return "🧠 思考过程:\n" + normalizedReasoning + "\n\n🤖 最终结果:\n" + normalizedAnswer;
+        return "🧠 思考过程:\n" + normalizedReasoning + "\n\n🤖 回复:\n" + normalizedAnswer;
     }
 
     private String preview(String content, int maxLength) {
@@ -297,9 +308,11 @@ public class Agent {
      *
      * 1. 在 content 出现之前，只要 reasoning 有实质内容（非空白），就立刻流式打印在"🧠 思考过程"下
      * 2. 仅空白的 reasoning delta 会先暂存，不触发标题——避免出现"空的思考过程"
-     * 3. content 一出现就收尾 reasoning 区，打印"🤖 最终结果"标题并流式输出 content
+     * 3. content 一出现就收尾 reasoning 区，打印"🤖 回复"标题并流式输出 content
+     *    （故意使用"回复"而不是"最终结果"：当模型在调用工具前先 narrate 一段时，"最终结果"会误导用户
+     *    认为下面的内容就是答案；"回复"在 narration 和真正最终回答两种情况下都准确）
      * 4. 如果 content 启动之后又收到 reasoning（服务器把思考内容追加在答案之后），
-     *    缓冲到 lateReasoning，最终在 finish() 用"🧠 补充思考"标题独立展示，不会污染最终结果区
+     *    缓冲到 lateReasoning，最终在 finish() 用"🧠 补充思考"标题独立展示，不会污染回复区
      */
     private static final class StreamRenderer implements GLMClient.StreamListener {
         private final StringBuilder pendingReasoning = new StringBuilder();
@@ -356,7 +369,7 @@ public class Agent {
                     pendingReasoning.setLength(0);
                     reasoningStarted = true;
                 }
-                System.out.println(AnsiStyle.section("🤖 最终结果"));
+                System.out.println(AnsiStyle.section("🤖 回复"));
                 contentRenderer = new TerminalMarkdownRenderer(System.out);
                 contentStarted = true;
                 streamedOutput = true;
@@ -403,6 +416,41 @@ public class Agent {
                 contentRenderer.flushPending();
             }
             System.out.flush();
+        }
+
+        /**
+         * 在一次迭代（通常是一次 tool-call 分支执行完后）和下一次迭代之间调用，
+         * 收尾当前的 reasoning/content 渲染器并重置所有状态。
+         *
+         * 这样下一轮迭代的 reasoning/content 到达时会重新打印 🧠 / 🤖 标题，
+         * 避免出现"上一轮的标题在屏幕高处、下一轮的内容出现在 HITL 块下方"的错位。
+         */
+        private void resetBetweenIterations() {
+            if (reasoningRenderer != null) {
+                reasoningRenderer.finish();
+                reasoningRenderer = null;
+            }
+            if (contentRenderer != null) {
+                contentRenderer.finish();
+                contentRenderer = null;
+            }
+            // 迭代间的 late reasoning 当场 flush（独立一段「补充思考」），不拖到 run() 结束
+            String late = lateReasoning.toString().trim();
+            if (!late.isEmpty()) {
+                System.out.println();
+                System.out.println(AnsiStyle.heading("🧠 补充思考"));
+                TerminalMarkdownRenderer r = new TerminalMarkdownRenderer(System.out);
+                r.append(late);
+                r.finish();
+                lateReasoning.setLength(0);
+                streamedOutput = true;
+            }
+            pendingReasoning.setLength(0);
+            reasoningStarted = false;
+            contentStarted = false;
+            if (streamedOutput) {
+                System.out.println();
+            }
         }
     }
 }

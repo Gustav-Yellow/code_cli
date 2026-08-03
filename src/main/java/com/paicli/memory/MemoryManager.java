@@ -163,6 +163,13 @@ public class MemoryManager {
                 tokenBudget.getUsageReport();
     }
 
+    /**
+     * 清空长期记忆（保留 Token 统计和压缩器状态不变）
+     */
+    public void clearLongTerm() {
+        longTermMemory.clear();
+    }
+
     // Getter
     public LongTermMemory getLongTermMemory() { return longTermMemory; }
     public TokenBudget getTokenBudget() { return tokenBudget; }

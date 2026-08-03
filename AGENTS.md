@@ -15,7 +15,7 @@
 - **核心依赖**：OkHttp 4.12（HTTP）、Jackson 2.16（JSON）、Logback 1.5（日志）、JLine 3.26（终端）、jieba-analysis 1.0.2（中文分词）、sqlite-jdbc 3.49（SQLite）、javaparser-core 3.28（AST 解析）
 - **默认 LLM**：智谱 GLM-5.2（`https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），OpenAI 兼容协议
 - **入口类**：`com.paicli.cli.Main`
-- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6–21 期见 ROADMAP.md
+- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7–21 期见 ROADMAP.md
 
 设计哲学：**手写优先，框架在后**。21 期主线全部手写完成后，才会开启 Pro 分支用 Spring AI / LangGraph4J 重构做对照实现。日常开发不要提前引入 Spring / LangChain4j 等框架抽象。
 
@@ -36,6 +36,7 @@ paicli/
 │   ├── chapter4-RAG开发.md
 │   ├── chapter4.1-Streaming_and_Log实现.md
 │   └── chapter5-Multi_Agent开发.md
+│   └── Chapter6-HITL实现.md
 └── src/main/java/com/paicli/
     ├── cli/
     │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令

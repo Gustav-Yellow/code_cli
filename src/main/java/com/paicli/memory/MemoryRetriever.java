@@ -53,7 +53,7 @@ public class MemoryRetriever {
         if (relevant.isEmpty()) return "";
 
         StringBuilder context = new StringBuilder();
-        context.append("## 相关记忆\n\n");
+        context.append("## 相关长期记忆\n\n");
 
         int usedTokens = 0;
         for (MemoryEntry entry : relevant) {

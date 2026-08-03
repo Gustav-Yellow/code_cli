@@ -156,6 +156,16 @@ public class PlanExecuteAgent {
         this(new GLMClient(apiKey), new ToolRegistry(), null, sharedHistory, sharedMemory, reviewHandler);
     }
 
+    /**
+     * 共享上下文 + 自定义 ToolRegistry 构造器：允许注入 HitlToolRegistry，
+     * 让 Plan 模式下的工具调用也走 HITL 审批。
+     */
+    public PlanExecuteAgent(String apiKey, ToolRegistry toolRegistry,
+                            PlanReviewHandler reviewHandler,
+                            List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
+        this(new GLMClient(apiKey), toolRegistry, null, sharedHistory, sharedMemory, reviewHandler);
+    }
+
     PlanExecuteAgent(GLMClient llmClient, ToolRegistry toolRegistry, Planner planner,
                      List<GLMClient.Message> sharedHistory, MemoryManager memoryManager,
                      PlanReviewHandler reviewHandler) {
@@ -556,8 +566,9 @@ public class PlanExecuteAgent {
                     response.toolCalls()
             ));
 
-            // 刷出缓冲区中的中间文本，确保在工具调用日志之前可见
-            streamRenderer.flushPending();
+            // 在工具执行前 flush 并重置流式渲染器：避免 Markdown renderer pending 文本
+            // 被 HITL 提示"跨过"导致 🧠 / 🤖 标题与内容错位
+            streamRenderer.resetBetweenIterations();
 
             for (GLMClient.ToolCall toolCall : response.toolCalls()) {
                 String toolName = toolCall.function().name();
@@ -797,6 +808,26 @@ public class PlanExecuteAgent {
                 contentRenderer.flushPending();
             }
             System.out.flush();
+        }
+
+        /**
+         * 两次 iteration 之间（通常是一次 tool-call 分支完成后）调用：收尾当前渲染器并重置状态，
+         * 让下一轮迭代能重新打印 🧠 / 🤖 标题，避免标题和内容被 HITL / 工具执行中断而错位。
+         */
+        private synchronized void resetBetweenIterations() {
+            if (reasoningRenderer != null) {
+                reasoningRenderer.finish();
+                reasoningRenderer = null;
+            }
+            if (contentRenderer != null) {
+                contentRenderer.finish();
+                contentRenderer = null;
+            }
+            reasoningStarted = false;
+            contentStarted = false;
+            if (streamedOutput) {
+                System.out.println();
+            }
         }
 
         private synchronized boolean hasStreamedOutput() {

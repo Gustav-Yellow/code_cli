@@ -3,7 +3,10 @@ package com.paicli.cli;
 import com.paicli.agent.Agent;
 import com.paicli.agent.AgentOrchestrator;
 import com.paicli.agent.PlanExecuteAgent;
+import com.paicli.hitl.HitlToolRegistry;
+import com.paicli.hitl.TerminalHitlHandler;
 import com.paicli.llm.GLMClient;
+import com.paicli.tool.ToolRegistry;
 import com.paicli.memory.MemoryManager;
 import com.paicli.plan.ExecutionPlan;
 import com.paicli.rag.CodeIndex;
@@ -26,11 +29,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * PaiCLI v5.0.0 - Multi-Agent Collaborative CLI
- * 支持 ReAct、Plan-and-Execute、Memory、RAG 与 Multi-Agent 能力
+ * PaiCLI v6.0.0 - Human-in-the-Loop CLI
+ * 支持 ReAct、Plan-and-Execute、Memory、RAG、Multi-Agent 与 HITL 审批能力
  */
 public class Main {
-    private static final String VERSION = "4.0.0";
+    private static final String VERSION = "6.0.0";
     private static final String ENV_FILE = ".env";
     private static final String LOG_DIR_PROPERTY = "paicli.log.dir";
     private static final String LOG_LEVEL_PROPERTY = "paicli.log.level";
@@ -134,8 +137,12 @@ public class Main {
             MemoryManager sharedMemory = new MemoryManager(new GLMClient(apiKey));
             List<GLMClient.Message> sharedHistory = new ArrayList<>();
 
-            // 默认使用 ReAct 模式
-            Agent reactAgent = new Agent(apiKey, sharedHistory, sharedMemory);
+            // 创建 HITL 处理器（默认关闭）
+            TerminalHitlHandler hitlHandler = new TerminalHitlHandler(false);
+            HitlToolRegistry hitlToolRegistry = new HitlToolRegistry(hitlHandler);
+
+            // 默认使用 ReAct 模式，注入 HITL 审批
+            Agent reactAgent = new Agent(apiKey, sharedHistory, sharedMemory, hitlToolRegistry);
             System.out.println("🔄 使用 ReAct 模式\n");
             // nextTaskUsePlanMode：/plan 命令设置此标记，下一条输入走 Plan 模式
             boolean nextTaskUsePlanMode = false;
@@ -150,7 +157,10 @@ public class Main {
             System.out.println("   - 输入 '/plan 任务内容' 直接用计划模式执行这条任务");
             System.out.println("   - 计划生成后可直接执行、补充要求重规划，或取消");
             System.out.println("   - 默认模式是 ReAct");
+            System.out.println("   - 输入 '/hitl on' 启用危险操作人工审批");
+            System.out.println("   - 输入 '/hitl off' 关闭 HITL 审批");
             System.out.println("   - 输入 '/memory' 查看记忆状态");
+            System.out.println("   - 输入 '/memory clear' 清空长期记忆");
             System.out.println("   - 输入 '/save 事实内容' 手动保存关键事实");
             System.out.println("   - 输入 '/clear' 清空对话历史");
             System.out.println("   - 输入 '/exit' 或 '/quit' 退出\n");
@@ -188,7 +198,7 @@ public class Main {
                 switch (command.type()) {
                     case UNKNOWN_COMMAND -> {
                         System.out.println("❌ 未知命令: " + command.payload());
-                        System.out.println("可用命令：/plan /clear /memory /save /index /search /graph /exit\n");
+                        System.out.println("可用命令：/plan /team /hitl /clear /memory /memory clear /save /index /search /graph /exit\n");
                         continue;
                     }
                     case EXIT -> {
@@ -197,13 +207,21 @@ public class Main {
                     }
                     case CLEAR -> {
                         reactAgent.clearHistory();
+                        hitlHandler.clearApprovedAll();
                         System.out.println("🗑️ 对话历史已清空，关键事实已保存到长期记忆\n");
                         continue;
                     }
                     case MEMORY_STATUS -> {
                         System.out.println("📋 记忆系统状态：");
                         System.out.println(reactAgent.getMemoryManager().getSystemStatus(sharedHistory));
+                        System.out.println("   /memory clear - 清空长期记忆");
+                        System.out.println("   /save <事实> - 手动保存到长期记忆");
                         System.out.println();
+                        continue;
+                    }
+                    case MEMORY_CLEAR -> {
+                        reactAgent.getMemoryManager().clearLongTerm();
+                        System.out.println("🧹 长期记忆已清空\n");
                         continue;
                     }
                     case MEMORY_SAVE -> {
@@ -232,6 +250,23 @@ public class Main {
                             continue;
                         }
                         input = command.payload();
+                    }
+                    case SWITCH_HITL -> {
+                        String payload = command.payload();
+                        if ("on".equals(payload)) {
+                            hitlHandler.setEnabled(true);
+                            System.out.println("🔒 HITL 审批已启用：write_file / execute_command / create_project 执行前将请求人工确认\n");
+                        } else if ("off".equals(payload)) {
+                            hitlHandler.setEnabled(false);
+                            hitlHandler.clearApprovedAll();
+                            System.out.println("🔓 HITL 审批已关闭：危险操作将直接执行\n");
+                        } else {
+                            String status = hitlHandler.isEnabled() ? "启用" : "关闭";
+                            System.out.println("🔒 HITL 当前状态：" + status);
+                            System.out.println("   /hitl on  - 启用人工审批");
+                            System.out.println("   /hitl off - 关闭人工审批\n");
+                        }
+                        continue;
                     }
                     case INDEX_CODE -> {
                         String indexPath = command.payload() != null ? command.payload() : ".";
@@ -311,7 +346,8 @@ public class Main {
                 System.out.println();
                 String response;
                 if (nextTaskUsePlanMode || command.type() == CliCommandParser.CommandType.SWITCH_PLAN) {
-                    PlanExecuteAgent planAgent = createPlanAgent(apiKey, terminal, lineReader, sharedHistory, sharedMemory);
+                    PlanExecuteAgent planAgent = createPlanAgent(apiKey, terminal, lineReader,
+                            sharedHistory, sharedMemory, hitlToolRegistry);
                     response = planAgent.run(input);
                     nextTaskUsePlanMode = false;  // 执行完毕后回到 ReAct
                  } else if (nextTaskUseTeamMode || command.type() == CliCommandParser.CommandType.SWITCH_TEAM) {
@@ -343,8 +379,15 @@ public class Main {
      */
     private static PlanExecuteAgent createPlanAgent(String apiKey, Terminal terminal, LineReader lineReader,
                                                     List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
+        return createPlanAgent(apiKey, terminal, lineReader, sharedHistory, sharedMemory, new ToolRegistry());
+    }
+
+    private static PlanExecuteAgent createPlanAgent(String apiKey, Terminal terminal, LineReader lineReader,
+                                                    List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory,
+                                                    ToolRegistry toolRegistry) {
         System.out.println("📋 使用 Plan-and-Execute 模式\n");
-        return new PlanExecuteAgent(apiKey, createPlanReviewHandler(terminal, lineReader), sharedHistory, sharedMemory);
+        return new PlanExecuteAgent(apiKey, toolRegistry,
+                createPlanReviewHandler(terminal, lineReader), sharedHistory, sharedMemory);
     }
 
     /**
@@ -662,8 +705,11 @@ public class Main {
                 "输入 '/team' 后，下一条任务使用 Multi-Agent 协作模式",
                 "输入 '/team 任务内容' 直接用多 Agent 协作执行这条任务",
                 "默认模式是 ReAct",
+                "输入 '/hitl on' 启用危险操作人工审批（HITL）",
+                "输入 '/hitl off' 关闭 HITL 审批",
                 "输入 '/clear' 清空对话历史",
                 "输入 '/memory' 查看记忆状态",
+                "输入 '/memory clear' 清空长期记忆",
                 "输入 '/save 事实内容' 手动保存关键事实",
                 "输入 '/exit' 或 '/quit' 退出"
         );
@@ -953,7 +999,7 @@ public class Main {
         System.out.println("║   ██║     ██║  ██║██║╚██████╗███████╗██║                ║");
         System.out.println("║   ╚═╝     ╚═╝  ╚═╝╚═╝ ╚═════╝╚══════╝╚═╝                ║");
         System.out.println("║                                                          ║");
-        System.out.printf("║      Memory-Enhanced Agent CLI %-8s                 ║%n", "v" + VERSION);
+        System.out.printf("║      HITL Approval CLI %-34s║%n", "v" + VERSION);
         System.out.println("║                                                          ║");
         System.out.println("╚══════════════════════════════════════════════════════════╝");
         System.out.println();
