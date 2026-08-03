@@ -1,6 +1,7 @@
 package com.paicli.cli;
 
 import com.paicli.agent.Agent;
+import com.paicli.agent.AgentOrchestrator;
 import com.paicli.agent.PlanExecuteAgent;
 import com.paicli.llm.GLMClient;
 import com.paicli.memory.MemoryManager;
@@ -25,8 +26,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * PaiCLI v4.0 - RAG-Enhanced Agent CLI
- * 支持 ReAct、Plan-and-Execute、Memory 与 RAG 能力
+ * PaiCLI v5.0.0 - Multi-Agent Collaborative CLI
+ * 支持 ReAct、Plan-and-Execute、Memory、RAG 与 Multi-Agent 能力
  */
 public class Main {
     private static final String VERSION = "4.0.0";
@@ -138,6 +139,8 @@ public class Main {
             System.out.println("🔄 使用 ReAct 模式\n");
             // nextTaskUsePlanMode：/plan 命令设置此标记，下一条输入走 Plan 模式
             boolean nextTaskUsePlanMode = false;
+            // nextTaskUseTeamMode：/team 命令设置此标记，下一条输入走 Team 模式
+            boolean nextTaskUseTeamMode = false;
 
             printStartupHints();
 
@@ -166,6 +169,10 @@ public class Main {
                     if (nextTaskUsePlanMode) {
                         nextTaskUsePlanMode = false;
                         System.out.println("↩️ 已取消待执行的 Plan-and-Execute，回到默认 ReAct。\n");
+                    }
+                    if (nextTaskUseTeamMode) {
+                        nextTaskUseTeamMode = false;
+                        System.out.println("↩️ 已取消待执行的 Multi-Agent，回到默认 ReAct。\n");
                     }
                     continue;
                 }
@@ -209,6 +216,14 @@ public class Main {
                             System.out.println("💾 已保存到长期记忆: " + fact + "\n");
                         }
                         continue;
+                    }
+                    case SWITCH_TEAM -> {
+                        if (command.payload() == null || command.payload().isEmpty()) {
+                            nextTaskUseTeamMode = true;
+                            System.out.println("👥 下一条任务将使用 Multi-Agent 协作模式（规划者 + 执行者 + 检查者），输入任务前按 ESC 可取消，执行完成后自动回到默认 ReAct。\n");
+                            continue;
+                        }
+                        input = command.payload();
                     }
                     case SWITCH_PLAN -> {
                         if (command.payload() == null || command.payload().isEmpty()) {
@@ -299,6 +314,10 @@ public class Main {
                     PlanExecuteAgent planAgent = createPlanAgent(apiKey, terminal, lineReader, sharedHistory, sharedMemory);
                     response = planAgent.run(input);
                     nextTaskUsePlanMode = false;  // 执行完毕后回到 ReAct
+                 } else if (nextTaskUseTeamMode || command.type() == CliCommandParser.CommandType.SWITCH_TEAM) {
+                    AgentOrchestrator orchestrator = createTeamAgent(apiKey, reactAgent, sharedHistory);
+                    response = orchestrator.run(input);
+                    nextTaskUseTeamMode = false;
                 } else {
                     response = reactAgent.run(input);
                 }
@@ -326,6 +345,26 @@ public class Main {
                                                     List<GLMClient.Message> sharedHistory, MemoryManager sharedMemory) {
         System.out.println("📋 使用 Plan-and-Execute 模式\n");
         return new PlanExecuteAgent(apiKey, createPlanReviewHandler(terminal, lineReader), sharedHistory, sharedMemory);
+    }
+
+    /**
+     * 创建 Multi-Agent 协作模式的 AgentOrchestrator —— 注入 PlanReviewHandler，
+     * 让用户在计划生成后能预览、补充要求、取消或直接执行。
+     * @param apiKey 密钥
+     * @param reactAgent ReAct 模式的 Agent
+     * @return AgentOrchestrator 调试器
+     */
+    private static AgentOrchestrator createTeamAgent(String apiKey, Agent reactAgent,
+                                                      List<GLMClient.Message> sharedHistory) {
+        System.out.println("👥 使用 Multi-Agent 协作模式\n");
+        // 复用 reactAgent 的 ToolRegistry、MemoryManager 和会话共享历史：
+        // - ToolRegistry 共享意味着 /index 设置的项目路径同步到 Multi-Agent
+        // - MemoryManager 共享避免重复加载长期记忆
+        // - sharedHistory 让 /team 执行结果写回，切回 ReAct 时上下文连续
+        return new AgentOrchestrator(apiKey,
+                reactAgent.getToolRegistry(),
+                reactAgent.getMemoryManager(),
+                sharedHistory);
     }
 
     /**
@@ -620,6 +659,8 @@ public class Main {
                 "输入 '/index [路径]' 为代码库建立向量索引",
                 "输入 '/search <查询>' 语义检索代码",
                 "输入 '/graph <类名>' 查看代码关系图谱",
+                "输入 '/team' 后，下一条任务使用 Multi-Agent 协作模式",
+                "输入 '/team 任务内容' 直接用多 Agent 协作执行这条任务",
                 "默认模式是 ReAct",
                 "输入 '/clear' 清空对话历史",
                 "输入 '/memory' 查看记忆状态",
