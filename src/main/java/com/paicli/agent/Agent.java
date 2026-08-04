@@ -3,6 +3,9 @@ package com.paicli.agent;
 import com.paicli.llm.LlmClient;
 import com.paicli.memory.ExplicitMemoryHints;
 import com.paicli.memory.MemoryManager;
+import com.paicli.skill.SkillContextBuffer;
+import com.paicli.skill.SkillIndexFormatter;
+import com.paicli.skill.SkillRegistry;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
 import com.paicli.tool.ToolRegistry.ToolInvocation;
@@ -32,6 +35,8 @@ public class Agent {
     private final List<LlmClient.Message> conversationHistory;
     private final MemoryManager memoryManager;
     private Supplier<String> externalContextSupplier = () -> "";
+    private SkillRegistry skillRegistry;
+    private SkillContextBuffer skillContextBuffer;
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
     // 系统提示词，给 Agent 限定身份
@@ -132,6 +137,14 @@ public class Agent {
         this.externalContextSupplier = externalContextSupplier == null ? () -> "" : externalContextSupplier;
     }
 
+    public void setSkillRegistry(SkillRegistry skillRegistry) {
+        this.skillRegistry = skillRegistry;
+    }
+
+    public void setSkillContextBuffer(SkillContextBuffer skillContextBuffer) {
+        this.skillContextBuffer = skillContextBuffer;
+    }
+
     /**
      * 运行 Agent 循环
      */
@@ -144,8 +157,9 @@ public class Agent {
         String memoryContext = memoryManager.buildContextForQuery(userInput, contextProfile.memoryContextTokens());
         updateSystemPromptWithMemory(memoryContext);
 
-        // 添加用户输入到历史（保持原文，不污染 user message）
-        conversationHistory.add(LlmClient.Message.user(userInput));
+        // 添加用户输入到历史（如有 skill body 注入，前置到原文之前）
+        String userMessageContent = prependSkillBodies(userInput);
+        conversationHistory.add(LlmClient.Message.user(userMessageContent));
 
         System.out.println("🤔 思考中...\n");
 
@@ -275,18 +289,44 @@ public class Agent {
      */
     private void updateSystemPromptWithMemory(String memoryContext) {
         String externalContext = buildExternalContext();
-        if ((memoryContext == null || memoryContext.isEmpty()) && externalContext.isEmpty()) {
+        String skillIndex = buildSkillIndex();
+        boolean hasMemory = memoryContext != null && !memoryContext.isEmpty();
+        boolean hasExternal = !externalContext.isEmpty();
+        boolean hasSkill = !skillIndex.isEmpty();
+        if (!hasMemory && !hasExternal && !hasSkill) {
             conversationHistory.set(0, LlmClient.Message.system(SYSTEM_PROMPT));
         } else {
             StringBuilder enrichedPrompt = new StringBuilder(SYSTEM_PROMPT);
-            if (memoryContext != null && !memoryContext.isEmpty()) {
+            if (hasMemory) {
                 enrichedPrompt.append("\n").append(memoryContext);
             }
-            if (!externalContext.isEmpty()) {
+            if (hasExternal) {
                 enrichedPrompt.append("\n").append(externalContext);
+            }
+            if (hasSkill) {
+                enrichedPrompt.append("\n").append(skillIndex);
             }
             conversationHistory.set(0, LlmClient.Message.system(enrichedPrompt.toString()));
         }
+    }
+
+    private String buildSkillIndex() {
+        if (skillRegistry == null) return "";
+        try {
+            return SkillIndexFormatter.format(skillRegistry.enabledSkills());
+        } catch (Exception e) {
+            log.warn("Failed to build skill index", e);
+            return "";
+        }
+    }
+
+    private String prependSkillBodies(String userInput) {
+        if (skillContextBuffer == null || skillContextBuffer.isEmpty()) {
+            return userInput;
+        }
+        String drained = skillContextBuffer.drain();
+        if (drained.isEmpty()) return userInput;
+        return drained + "\n用户输入：\n" + userInput;
     }
 
     private String buildExternalContext() {

@@ -3,6 +3,8 @@ package com.paicli.agent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.llm.LlmClient;
+import com.paicli.skill.SkillIndexFormatter;
+import com.paicli.skill.SkillRegistry;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
 import com.paicli.tool.ToolRegistry.ToolInvocation;
@@ -33,6 +35,7 @@ public class SubAgent {
     private final LlmClient llmClient;
     private final ToolRegistry toolRegistry;
     private final List<LlmClient.Message> conversationHistory;
+    private SkillRegistry skillRegistry;
 
     // 各角色的系统提示词
     private static final String PLANNER_PROMPT = """
@@ -136,15 +139,31 @@ public class SubAgent {
         this.conversationHistory.add(LlmClient.Message.system(getSystemPrompt()));
     }
 
+    public void setSkillRegistry(SkillRegistry skillRegistry) {
+        this.skillRegistry = skillRegistry;
+    }
+
     /**
-     * 根据角色获取系统提示词
+     * 根据角色获取系统提示词（WORKER 和 REVIEWER 追加 skill 索引）。
      */
     private String getSystemPrompt() {
-        return switch (role) {
+        String basePrompt = switch (role) {
             case PLANNER -> PLANNER_PROMPT;
             case WORKER -> WORKER_PROMPT;
             case REVIEWER -> REVIEWER_PROMPT;
         };
+        // Planner 只输出 JSON，不需要 skill 索引
+        if (role == AgentRole.PLANNER || skillRegistry == null) {
+            return basePrompt;
+        }
+        try {
+            String skillIndex = SkillIndexFormatter.format(skillRegistry.enabledSkills());
+            if (skillIndex.isEmpty()) return basePrompt;
+            return basePrompt + "\n" + skillIndex;
+        } catch (Exception e) {
+            log.warn("[{}] Failed to build skill index", name, e);
+            return basePrompt;
+        }
     }
 
     /**

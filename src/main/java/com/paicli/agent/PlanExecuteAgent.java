@@ -7,6 +7,9 @@ import com.paicli.llm.GLMClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.plan.*;
 import com.paicli.runtime.CancellationContext;
+import com.paicli.skill.SkillContextBuffer;
+import com.paicli.skill.SkillIndexFormatter;
+import com.paicli.skill.SkillRegistry;
 import com.paicli.util.AnsiStyle;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
@@ -124,6 +127,8 @@ public class PlanExecuteAgent {
     private final MemoryManager memoryManager;
     /** 会话级共享对话历史 —— 与 ReAct 共享，模式切换时上下文连续 */
     private final List<LlmClient.Message> sharedHistory;
+    private SkillRegistry skillRegistry;
+    private SkillContextBuffer skillContextBuffer;
 
 
     private static final String EXECUTION_PROMPT = """
@@ -212,6 +217,29 @@ public class PlanExecuteAgent {
         this.toolRegistry.setContextProfile(this.memoryManager.getContextProfile());
         this.toolRegistry.setMemorySaver(this.memoryManager::storeFact);
         this.sharedHistory = sharedHistory;
+    }
+
+    public void setSkillRegistry(SkillRegistry skillRegistry) {
+        this.skillRegistry = skillRegistry;
+    }
+
+    public void setSkillContextBuffer(SkillContextBuffer skillContextBuffer) {
+        this.skillContextBuffer = skillContextBuffer;
+    }
+
+    /**
+     * 构建带 skill 索引的系统提示词（在 EXECUTION_PROMPT 末尾追加启用 skill 的索引段）。
+     */
+    private String buildExecutionPrompt() {
+        if (skillRegistry == null) return EXECUTION_PROMPT;
+        try {
+            String skillIndex = SkillIndexFormatter.format(skillRegistry.enabledSkills());
+            if (skillIndex.isEmpty()) return EXECUTION_PROMPT;
+            return EXECUTION_PROMPT + "\n" + skillIndex;
+        } catch (Exception e) {
+            log.warn("Failed to build skill index for PlanExecuteAgent", e);
+            return EXECUTION_PROMPT;
+        }
     }
 
     /**
@@ -588,7 +616,7 @@ public class PlanExecuteAgent {
      */
     private TaskRunResult executeTask(String goal, ExecutionPlan plan, Task task,
                                       StreamState streamState, PrintStream out) throws IOException {
-        String prompt = String.format(EXECUTION_PROMPT,
+        String prompt = String.format(buildExecutionPrompt(),
                 task.getType(), task.getDescription());
 
         // 注入长期记忆上下文（检索与任务描述相关的长期记忆）

@@ -83,6 +83,8 @@ public class ToolRegistry {
     private BrowserGuard browserGuard;
     private BrowserConnector browserConnector;
     private java.util.function.Consumer<String> memorySaver;
+    private com.paicli.skill.SkillRegistry skillRegistry;
+    private com.paicli.skill.SkillContextBuffer skillContextBuffer;
 
     public ToolRegistry() {
         this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS);
@@ -103,6 +105,7 @@ public class ToolRegistry {
         registerWebTools();
         registerBrowserTools();
         registerMemoryTools();
+        registerSkillTools();
     }
 
     /**
@@ -148,6 +151,28 @@ public class ToolRegistry {
      */
     public void setMemorySaver(java.util.function.Consumer<String> memorySaver) {
         this.memorySaver = memorySaver;
+    }
+
+    /**
+     * 注入 Skill 注册表，使 load_skill 工具能查找和加载 Skill。
+     */
+    public void setSkillRegistry(com.paicli.skill.SkillRegistry skillRegistry) {
+        this.skillRegistry = skillRegistry;
+    }
+
+    public com.paicli.skill.SkillRegistry getSkillRegistry() {
+        return skillRegistry;
+    }
+
+    /**
+     * 注入 Skill 上下文缓冲区，load_skill 工具将 body 推入此缓冲区。
+     */
+    public void setSkillContextBuffer(com.paicli.skill.SkillContextBuffer skillContextBuffer) {
+        this.skillContextBuffer = skillContextBuffer;
+    }
+
+    public com.paicli.skill.SkillContextBuffer getSkillContextBuffer() {
+        return skillContextBuffer;
     }
 
     /**
@@ -395,6 +420,47 @@ public class ToolRegistry {
                     String normalized = fact.trim();
                     memorySaver.accept(normalized);
                     return "💾 已保存到长期记忆: " + normalized;
+                }
+        ));
+    }
+
+    /**
+     * 注册 Skill 系统工具：load_skill —— LLM 主动调用以加载完整 Skill 指引。
+     */
+    private void registerSkillTools() {
+        tools.put("load_skill", new Tool(
+                "load_skill",
+                "Load full SKILL.md instructions for a skill the system has indexed (see the \"可用 Skills\" section in this system prompt). Call this when a skill's description matches the current task. Pass the exact kebab-case skill name. The full body will appear at the start of your next user message under \"## 已加载 Skill：<name>\". Don't reload the same skill twice in one session.",
+                createParameters(new Param("name", "string", "the exact kebab-case skill name (e.g. web-access)", true)),
+                args -> {
+                    String name = args.get("name");
+                    if (name == null || name.isBlank()) {
+                        return "load_skill 失败: name 不能为空";
+                    }
+                    if (skillRegistry == null) {
+                        return "load_skill 失败: Skill 系统未初始化";
+                    }
+                    com.paicli.skill.Skill skill = skillRegistry.findSkill(name);
+                    if (skill == null) {
+                        com.paicli.skill.Skill any = skillRegistry.findAnySkill(name);
+                        if (any == null) {
+                            return "Skill '" + name + "' 未找到，可用 /skill list 查看可用 skill";
+                        }
+                        return "Skill '" + name + "' 已被禁用，可用 /skill on " + name + " 启用";
+                    }
+                    String body = skill.body();
+                    int originalLen = body == null ? 0 : body.length();
+                    int max = 5 * 1024;
+                    String injected = body == null ? "" : body;
+                    if (injected.length() > max) {
+                        injected = injected.substring(0, max)
+                                + "\n\n...(skill body truncated, full content via /skill show " + name + ")";
+                    }
+                    if (skillContextBuffer != null) {
+                        skillContextBuffer.push(name, injected);
+                    }
+                    return "已加载 skill '" + name + "' 的完整指引（" + originalLen
+                            + " bytes），将在下一轮上下文中以 \"## 已加载 Skill：" + name + "\" 段出现。";
                 }
         ));
     }

@@ -6,6 +6,8 @@ import com.paicli.llm.LlmClient;
 import com.paicli.llm.GLMClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.runtime.CancellationContext;
+import com.paicli.skill.SkillContextBuffer;
+import com.paicli.skill.SkillRegistry;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.util.AnsiStyle;
 import org.slf4j.Logger;
@@ -116,6 +118,19 @@ public class AgentOrchestrator {
         this.reviewer = new SubAgent("reviewer", AgentRole.REVIEWER, llmClient, toolRegistry);
         this.memoryManager = memoryManager;
         this.sharedHistory = sharedHistory;
+    }
+
+    /**
+     * 注入 Skill 系统：将 skillRegistry 分发给所有需要工具调用能力的 SubAgent（Worker / Reviewer），
+     * 并在 toolRegistry 上设置 skillContextBuffer 使 load_skill 工具可用。
+     */
+    public void setSkillSystem(SkillRegistry skillRegistry, SkillContextBuffer skillContextBuffer) {
+        for (SubAgent worker : workers) {
+            worker.setSkillRegistry(skillRegistry);
+        }
+        reviewer.setSkillRegistry(skillRegistry);
+        toolRegistry.setSkillRegistry(skillRegistry);
+        toolRegistry.setSkillContextBuffer(skillContextBuffer);
     }
 
     /**

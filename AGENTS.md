@@ -15,7 +15,7 @@
 - **核心依赖**：OkHttp 4.12（HTTP）、Jackson 2.16（JSON）、Logback 1.5（日志）、JLine 3.26（终端）、jieba-analysis 1.0.2（中文分词）、sqlite-jdbc 3.49（SQLite）、javaparser-core 3.28（AST 解析）
 - **默认 LLM**：智谱 GLM-5.2（`https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），OpenAI 兼容协议
 - **入口类**：`com.paicli.cli.Main`
-- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7 期（异步并行工具执行）已完成并文档化（`docs/Chapter7-Async_Parallel实现.md`）；第 7.1 期（LLMClient 多模型适配）已完成并文档化（`docs/Chapter7.1-LLMClient开发.md`）；第 8 期（Web Search Tool 联网工具）已完成并文档化（`docs/Chapter8-Web_Search_Tool开发.md`）；第 9–11 期（MCP 协议核心 + 高级能力 + Chrome DevTools + 长上下文）已完成并文档化（`docs/Chapter9-MCP开发.md`）；第 10 期（CDP 会话复用 + 浏览器登录态持久化）已完成并文档化（`docs/Chapter10-CDP开发.md`）；第 12–21 期见 ROADMAP.md
+- **当前进度**：第 1–14 期已完成并文档化；第 15 期（Skill 系统 + web-access Skill）已完成并文档化（`docs/Chapter11-Skill开发.md`）；第 16–21 期见 ROADMAP.md
 
 设计哲学：**手写优先，框架在后**。21 期主线全部手写完成后，才会开启 Pro 分支用 Spring AI / LangGraph4J 重构做对照实现。日常开发不要提前引入 Spring / LangChain4j 等框架抽象。
 
@@ -42,12 +42,14 @@ paicli/
 │   └── Chapter8-Web_Search_Tool开发.md
 │   └── Chapter9-MCP开发.md
 │   └── Chapter10-CDP开发.md
+│   └── Chapter11-Skill开发.md
 └── src/main/java/com/paicli/
     ├── cli/
-    │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令 + /browser
-    │   ├── CliCommandParser.java      # 命令解析（/plan /exit /clear /index /search /graph /browser）
+    │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令 + /browser + /skill
+    │   ├── CliCommandParser.java      # 命令解析（/plan /exit /clear /index /search /graph /browser /skill）
     │   ├── PaiCliCompleter.java       # JLine 组合补全器（斜杠命令 + @-mention）
-    │   └── PlanReviewInputParser.java # 审查输入解析（EXECUTE/SUPPLEMENT/CANCEL）
+    │   ├── PlanReviewInputParser.java # 审查输入解析（EXECUTE/SUPPLEMENT/CANCEL）
+    │   └── SkillCommandHandler.java   # /skill 命令组（list/show/on/off/reload）
     ├── agent/
     │   ├── Agent.java                 # ReAct 循环（思考-行动-观察）
     │   ├── AgentBudget.java           # Agent 循环退出预算（Token/停滞/硬轮数保险阀）
@@ -163,8 +165,22 @@ paicli/
     ├── runtime/
     │   ├── CancellationContext.java       # 取消上下文（ThreadLocal + 全局 fallback）
     │   └── CancellationToken.java         # 取消令牌（原子标记 + 线程中断感知）
+    ├── skill/
+    │   ├── Skill.java                     # 不可变数据模型（name/description/body/source/path）
+    │   ├── SkillFrontmatterParser.java    # 手写 YAML frontmatter 解析器（无第三方依赖）
+    │   ├── SkillRegistry.java             # 三层目录加载 + 同名覆盖 + 启用过滤
+    │   ├── SkillIndexFormatter.java       # system prompt 索引段渲染（三重预算约束）
+    │   ├── SkillContextBuffer.java        # LRU 惰性注入缓冲区（最多 3 个，一次性消费）
+    │   ├── SkillBuiltinExtractor.java     # jar 内置 skill 解压到 ~/.paicli/skills-cache/
+    │   └── SkillStateStore.java           # ~/.paicli/skills.json 启用状态持久化
 └── src/main/resources/
-    └── logback.xml                      # Logback 日志滚动配置
+    ├── logback.xml                      # Logback 日志滚动配置
+    └── skills/
+        └── web-access/
+            ├── SKILL.md                 # web-access 决策手册（110 行）
+            └── references/
+                ├── cdp-cheatsheet.md    # 28 个 CDP MCP 工具速查
+                └── site-patterns/       # 6 个站点经验文件（GitHub/掘金/公众号/知乎/Twitter/小红书）
 ```
 
 > 后续期次会新增 `mcp/`、`hitl/`、`skill/`、`tui/` 等包。新增包时请在上方目录树补一行，并在第 4 节追加模块说明。
@@ -291,10 +307,10 @@ paicli/
 - 第 8 期会抽象出 `LlmClient` 接口与 `AbstractOpenAiCompatibleClient` 基类，届时 GLMClient 会瘦身为子类
 - 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 2 节
 
-### 4.4 `tool.ToolRegistry` — 工具注册表（第 1 期基础，第 4/7/8/10 期增强）
+### 4.4 `tool.ToolRegistry` — 工具注册表（第 1 期基础，第 4/7/8/10/15 期增强）
 
 - 文件：`src/main/java/com/paicli/tool/ToolRegistry.java`
-- 12 个内置工具：
+- 13 个内置工具：
   | 工具名 | 参数 | 用途 | 期次 |
   |---|---|---|---|
   | `read_file` | `path` | 读取文件 | 1 |
@@ -309,6 +325,7 @@ paicli/
   | `browser_disconnect` | — | Agent 切回 isolated 浏览器模式 | 10 |
   | `browser_status` | — | Agent 查看浏览器连接状态 | 10 |
   | `save_memory` | `fact` | LLM 保存长期记忆（"记一下/记住"时调用） | 10 |
+  | `load_skill` | `name` | LLM 按需加载 Skill 完整指引到下一轮 user message | 15 |
 - 关键设计：
   - `Tool` record 含 `executor`（函数式接口 `ToolExecutor`），注册时用 lambda 提供执行逻辑
   - `createParameters(Param...)` 动态生成 JSON Schema（type/description/required），传给 LLM
@@ -322,6 +339,9 @@ paicli/
   - `registerBrowserTools()` / `registerMemoryTools()`：注册新增的 4 个工具
   - `executeTool()` 中 MCP 工具执行前 → `checkBrowserTool()` 拦截；执行后 → `browserGuard.applyAfterExecution()` 更新状态
   - 审计记录全部传递 `BrowserAuditMetadata`（mode / sensitive / targetUrl）
+- **第 15 期增强（Skill 系统）**：
+  - `skillRegistry` / `skillContextBuffer` 字段 + setter/getter：使 `load_skill` 工具能查找 Skill 并写入注入缓冲区
+  - `registerSkillTools()`：注册 `load_skill` 工具（body 5KB 截断，已禁用 skill 提示 `/skill on`，未找到提示 `/skill list`）
 
 ### 4.5 `agent.PlanExecuteAgent` — Plan-and-Execute 编排（第 2 期基础，第 3/4.1 期增强）
 
@@ -728,6 +748,47 @@ paicli/
   3. 从上下文提取 URL host → 生成精确事实（如"访问 yuque.com（语雀）时优先复用用户已登录的 Chrome 登录态。"）
 - **Agent 集成**：`Agent.run()` 中每轮用户输入时调用 `storeExplicitBrowserMemoryHint()` → `ExplicitMemoryHints.browserLoginFact()` → `memoryManager.storeFact()`
 
+### 4.21 `skill` 包 — Skill 系统（第 15 期新增）
+
+- 文件：`src/main/java/com/paicli/skill/` 下 7 个类（见目录树）+ `src/main/java/com/paicli/cli/SkillCommandHandler.java`
+- **整体设计**：
+  - Skill 是「决策手册 + 按需取用的资料库」的可复用单元，由 `SKILL.md`（含 YAML frontmatter）+ 可选 `references/` 目录组成
+  - 三层目录加载：jar 内置（`resources/skills/`）→ 用户级（`~/.paicli/skills/`）→ 项目级（`./.paicli/skills/`），同名后者**整体覆盖**前者
+  - 启动期将启用 Skill 的 `name` + `description` 注入 Agent / PlanExecuteAgent / SubAgent 的 system prompt 末尾（"轻量索引"）
+  - LLM 判断任务匹配时调用 `load_skill(name)` 工具 → body 写入 `SkillContextBuffer` → 下一轮 user message 开头自动注入
+  - CLI 命令组 `/skill list|show|on|off|reload`
+- **核心类**：
+
+| 类 | 职责 |
+|---|---|
+| `Skill` | Java 17 record：name / description / version / author / tags / source(BUILTIN/USER/PROJECT) / body / skillMdPath / referencesDir |
+| `SkillFrontmatterParser` | 手写 YAML 子集解析器（~190 行）：支持单行字符串、多行 literal block（`\|`）、行内数组（`[a, b]`）；不支持嵌套对象/anchor/复杂类型，命中即 warning 跳过该字段 |
+| `SkillRegistry` | 三层目录扫描 + 同名覆盖 + `enabledSkills()` 过滤 disabled 列表；`findSkill(name)` 只返已启用；`findAnySkill(name)` 返任意；`reload()` 清空重建 |
+| `SkillIndexFormatter` | 把启用 skill 渲染成 system prompt 索引段（含判断准则），三重预算约束：单 description ≤ 500 codepoint、启用数 ≤ 20、总段 ≤ 4096 字符 |
+| `SkillContextBuffer` | LRU 缓冲区（最多 3 个 skill body），`push(name, body)` 写入 + 去重 + 淘汰最旧；`drain()` 取出全部并清空（一次性消费）；主 Agent / PlanExecuteAgent / AgentOrchestrator 三角色各持独立实例 |
+| `SkillBuiltinExtractor` | 启动期把 jar 内 `resources/skills/` 解压到 `~/.paicli/skills-cache/`，通过 `.version` 文件标记版本避免重复解压；文件清单硬编码（避免 jar 内 resource walk 跨平台问题） |
+| `SkillStateStore` | 读写 `~/.paicli/skills.json`（`{"disabled": ["name1", ...]}`），文件不存在视为空；默认全启用，只持久化 disabled 列表 |
+
+- **CLI 集成**：
+  - `SkillCommandHandler`：`startupSummary()` / `list()` / `show()` / `enable()` / `disable()` 五个静态方法
+  - `CliCommandParser`：新增 `SKILL_LIST` / `SKILL_SHOW` / `SKILL_ON` / `SKILL_OFF` / `SKILL_RELOAD` 枚举 + 解析规则
+  - `Main.java`：启动期初始化 Skill 系统（Extractor → StateStore → Registry → Buffer → 注入 ToolRegistry + 三个 Agent 模式）；`/skill` 命令 dispatch；Banner 升 v15.0.0 `Skill-Driven Agent CLI`
+- **Agent 集成**：
+  - `Agent.java`：`updateSystemPromptWithMemory()` 追加 `buildSkillIndex()`；`run()` 中 user message 前调 `prependSkillBodies()`（复用现有 `memoryManager.compressContextIfNeeded()`，不引入新的压缩器）
+  - `PlanExecuteAgent.java`：`buildExecutionPrompt()` 在硬编码 `EXECUTION_PROMPT` 末尾拼接 skill 索引
+  - `SubAgent.java`：`getSystemPrompt()` 给 WORKER 和 REVIEWER 拼接 skill 索引（PLANNER 不需要，只输出 JSON）
+  - `AgentOrchestrator.java`：`setSkillSystem()` 分发给 workers + reviewer + toolRegistry
+  - `ToolRegistry.java`：新增 `load_skill` 内置工具（注册在 `registerSkillTools()`）；工具 body 5KB 截断；返回简短确认不返回 body 正文
+- **内置 `web-access` Skill**：
+  - `SKILL.md`（~110 行）：浏览哲学四步法 + 工具选择表（7 种场景） + 浏览器四级优先级 + Jina Reader 兜底 + 登录态判断准则 + CDP 工具速查引用 + 站点经验目录用法 + 并行调研策略 + 不要做的事清单
+  - `references/cdp-cheatsheet.md`：28 个 chrome-devtools MCP 工具速查（导航/输入/调试/网络/性能/模拟/扩展/内存 8 类）
+  - `references/site-patterns/` 下 6 个站点经验文件（`github.com.md` / `juejin.cn.md` / `mp.weixin.qq.com.md` / `x.com.md` / `xiaohongshu.com.md` / `zhuanlan.zhihu.com.md`），每个按三段式模板：平台特征 + 有效模式（可执行 JS 片段） + 已知陷阱（失败模式+原因+应对）
+- **设计要点**：
+  - body 注入选 user message 而非 system prompt（system 不变 → prompt cache 命中率高；user 每轮重发，注入自然衰减）
+  - 三层覆盖是整体替换（非字段级 merge），用户改一处即可完全控制
+  - 与 HITL 协同：Skill 内推荐的危险工具调用（如 `execute_command "curl r.jina.ai/..."`）仍走既有 `HitlToolRegistry` 审批流，不给 Skill 单独审批维度
+- 详见 `docs/Chapter11-Skill开发.md`
+
 ---
 
 ## 5. 开发与运行
@@ -777,7 +838,7 @@ java -jar target/paicli-0.0.1-SNAPSHOT.jar
 | 10–11 | MCP 高级 + Chrome DevTools + 长上下文 | `McpResourceCache` / `McpResourceTool` / `AtMentionParser` / `NotificationRouter` / `CancellationContext` / `ContextProfile` / `TokenUsageFormatter` / HITL server 全放行 | 已完成 → [4.16](#416-mcp-包--mcp-协议集成第-9–11-期) + [4.17](#417-context-包--上下文策略第-11-期) + [4.18](#418-runtime-包--运行时取消第-10-期) |
 | 12 | 长上下文 | `AgentBudget` / `ContextProfile` | 已完成 ↑（合并入第 11 期） |
 | 13–14 | Chrome DevTools MCP + CDP 会话复用 | `BrowserSession` / `BrowserGuard` / `SensitivePagePolicy` / `BrowserConnectivityCheck` / `BrowserConnector` / `ExplicitMemoryHints` / `PaiCliCompleter` | 已完成 → [4.19](#419-browser-包--cdp-浏览器会话管理第-10-期新增) + [4.20](#420-memoryexplicitmemoryhints--显式记忆提示第-10-期新增) + `docs/Chapter10-CDP开发.md` |
-| 15 | Skill 系统 | `SkillLoader` / `SkillContextBuffer` | 未开始 |
+| 15 | Skill 系统 | `Skill` / `SkillRegistry` / `SkillFrontmatterParser` / `SkillIndexFormatter` / `SkillContextBuffer` / `SkillBuiltinExtractor` / `SkillStateStore` / `SkillCommandHandler` | 已完成 → [4.21](#421-skill-包--skill-系统第-15-期新增) + `docs/Chapter11-Skill开发.md` |
 | 16 | TUI 产品化 | `Renderer` 接口 + inline/lanterna/plain 三实现 | 未开始 |
 | 17 | LSP 诊断 | `LspManager` / `LspHooks` | 未开始 |
 | 18 | Git 快照 | `SideGitManager`（JGit） | 未开始 |
