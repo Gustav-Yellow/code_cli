@@ -15,7 +15,7 @@
 - **核心依赖**：OkHttp 4.12（HTTP）、Jackson 2.16（JSON）、Logback 1.5（日志）、JLine 3.26（终端）、jieba-analysis 1.0.2（中文分词）、sqlite-jdbc 3.49（SQLite）、javaparser-core 3.28（AST 解析）
 - **默认 LLM**：智谱 GLM-5.2（`https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），OpenAI 兼容协议
 - **入口类**：`com.paicli.cli.Main`
-- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7 期（异步并行工具执行）已完成并文档化（`docs/Chapter7-Async_Parallel实现.md`）；第 7.1 期（LLMClient 多模型适配）已完成并文档化（`docs/Chapter7.1-LLMClient开发.md`）；第 8 期（Web Search Tool 联网工具）已完成并文档化（`docs/Chapter8-Web_Search_Tool开发.md`）；第 9 期（MCP 协议核心）已完成并文档化（`docs/Chapter9-MCP开发.md`）；第 10 期（MCP 高级能力 — resources / @-mention / 通知 / 取消）已完成；第 11 期（Chrome DevTools MCP + 长上下文策略）已完成；第 12–21 期见 ROADMAP.md
+- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7 期（异步并行工具执行）已完成并文档化（`docs/Chapter7-Async_Parallel实现.md`）；第 7.1 期（LLMClient 多模型适配）已完成并文档化（`docs/Chapter7.1-LLMClient开发.md`）；第 8 期（Web Search Tool 联网工具）已完成并文档化（`docs/Chapter8-Web_Search_Tool开发.md`）；第 9–11 期（MCP 协议核心 + 高级能力 + Chrome DevTools + 长上下文）已完成并文档化（`docs/Chapter9-MCP开发.md`）；第 10 期（CDP 会话复用 + 浏览器登录态持久化）已完成并文档化（`docs/Chapter10-CDP开发.md`）；第 12–21 期见 ROADMAP.md
 
 设计哲学：**手写优先，框架在后**。21 期主线全部手写完成后，才会开启 Pro 分支用 Spring AI / LangGraph4J 重构做对照实现。日常开发不要提前引入 Spring / LangChain4j 等框架抽象。
 
@@ -41,10 +41,12 @@ paicli/
 │   └── Chapter7.1-LLMClient开发.md
 │   └── Chapter8-Web_Search_Tool开发.md
 │   └── Chapter9-MCP开发.md
+│   └── Chapter10-CDP开发.md
 └── src/main/java/com/paicli/
     ├── cli/
-    │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令
-    │   ├── CliCommandParser.java      # 命令解析（/plan /exit /clear /index /search /graph）
+    │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令 + /browser
+    │   ├── CliCommandParser.java      # 命令解析（/plan /exit /clear /index /search /graph /browser）
+    │   ├── PaiCliCompleter.java       # JLine 组合补全器（斜杠命令 + @-mention）
     │   └── PlanReviewInputParser.java # 审查输入解析（EXECUTE/SUPPLEMENT/CANCEL）
     ├── agent/
     │   ├── Agent.java                 # ReAct 循环（思考-行动-观察）
@@ -74,6 +76,7 @@ paicli/
     │   ├── MemoryRetriever.java       # 长期记忆检索 + 相关度排序
     │   ├── MemoryQueryTokenizer.java  # jieba 中文分词器
     │   ├── TokenBudget.java           # Token 预算管理 + 使用统计
+    │   ├── ExplicitMemoryHints.java   # 自动识别"记住 + 浏览器登录复用"意图
     │   └── MemoryManager.java         # 门面类（组合上述组件）
     ├── rag/
     │   ├── CodeChunk.java             # 代码块数据模型（file/class/method 粒度）
@@ -108,6 +111,15 @@ paicli/
         ├── HitlHandler.java             # 审批交互接口 + 工具/server 维度全放行
         ├── HitlToolRegistry.java        # 透明 HITL 拦截层（继承 ToolRegistry，MCP 全放行预检）
         └── TerminalHitlHandler.java      # 终端交互实现（y/a→子菜单/n/s/m + server 维度放行）
+    ├── browser/
+    │   ├── BrowserMode.java              # ISOLATED / SHARED 枚举
+    │   ├── BrowserSession.java           # 线程安全会话状态 + Tab 跟踪
+    │   ├── BrowserGuard.java             # 浏览器操作策略执行器（拦截 + 审批 + 状态变更）
+    │   ├── SensitivePagePolicy.java      # 敏感 URL glob → regex 匹配（14 条默认规则）
+    │   ├── BrowserConnectivityCheck.java # CDP 端口 HTTP 探活（GET /json/version）
+    │   ├── BrowserCheckResult.java       # 策略检查结果 record
+    │   ├── BrowserAuditMetadata.java     # 审计元数据 record
+    │   └── BrowserConnector.java         # Agent 可调用的浏览器连接接口
     ├── mcp/
     │   ├── McpServerStatus.java          # Server 状态枚举（STARTING/READY/DISABLED/ERROR）
     │   ├── McpClient.java                # MCP 协议客户端（initialize + tools + resources + prompts + notifications）
@@ -210,24 +222,30 @@ paicli/
 
 > 每个 module 一节。新增类时请在本节追加；重构类时请同步更新。
 
-### 4.1 `cli.Main` — CLI 入口（第 1 期基础，第 2/4/4.1 期增强）
+### 4.1 `cli.Main` — CLI 入口（第 1 期基础，第 2/4/4.1 期增强，第 10 期增强）
 
-- 文件：`src/main/java/com/paicli/cli/Main.java`、`src/main/java/com/paicli/cli/CliCommandParser.java`、`src/main/java/com/paicli/cli/PlanReviewInputParser.java`
+- 文件：`src/main/java/com/paicli/cli/Main.java`、`src/main/java/com/paicli/cli/CliCommandParser.java`、`src/main/java/com/paicli/cli/PaiCliCompleter.java`、`src/main/java/com/paicli/cli/PlanReviewInputParser.java`
 - 职责：
   - 启动 banner 打印
   - **日志配置**：`configureLogging()` 初始化 Logback（日志目录、级别、滚动策略），`configureLogProperty()` 支持系统属性 → 环境变量 → `.env` 三层回退
   - **`.env` 全量加载**：`loadEnvConfig()` 解析 `.env` 中所有 `KEY=VALUE` → `System.setProperty()`，使 `EmbeddingClient`、`GLMClient` 等组件通过 `System.getProperty(key)` 即可读取配置
   - API Key 加载顺序：当前目录 `.env` → `~/.env` → 环境变量 `GLM_API_KEY`
   - **JLine 终端控制**：raw mode 单键读取、ESC 序列分类（`EscapeSequenceType`）、方向键历史导航填充（`seedBufferForHistoryNavigation`）、括号粘贴处理、`NonBlockingReader` 优化输入读取
-  - **模式路由**：`/plan` 命令切换到 Plan 模式；`/index` `/search` `/graph` 触发 RAG 功能；未知 `/` 命令显示可用命令列表
+  - **模式路由**：`/plan` 命令切换到 Plan 模式；`/index` `/search` `/graph` 触发 RAG 功能；未知 `/` 命令显示结构化的命令列表（`printSlashCommandHelp()`）
   - **计划审查**：通过 `createPlanReviewHandler()` 注入 `PlanReviewHandler`
   - ReAct 模式：`Agent.run()` 循环调用 LLM + 工具
   - Plan 模式：`PlanExecuteAgent.run()` 先规划后执行
   - **流式输出适配**：空响应（已流式输出过）不重复打印
+  - **第 10 期增强（CDP 会话复用）**：
+    - 浏览器会话管理：初始化 `BrowserSession` / `BrowserConnectivityCheck` / `BrowserGuard` / `BrowserConnector`
+    - `/browser` 命令组：`status` / `connect`（autoConnect 或 port）/ `disconnect` / `tabs`
+    - `handleBrowserCommand()` 路由 + `browserAutoConnect()` / `browserConnectByPort()` / `browserDisconnect()` / `browserTabs()` 四个子命令
+    - `SlashCommandHint` record + `slashCommandHints()`（35 条命令）→ `PaiCliCompleter` JLine 补全 + `configureSlashCommandHint()` 按键绑定
+    - 审计输出增强：`BrowserAuditMetadata` 信息展示
 - 关键约定：API Key 找不到时直接 `System.exit(1)`，不进入交互循环
-- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 8 节 + `docs/chapter4-RAG开发.md` 第 6 节 + `docs/chapter4.1-Streaming_and_Log实现.md` 第 8-9 节
+- 详见 `docs/chapter2-Plan-and-Execute实现.md` 第 8 节 + `docs/chapter4-RAG开发.md` 第 6 节 + `docs/chapter4.1-Streaming_and_Log实现.md` 第 8-9 节 + `docs/Chapter10-CDP开发.md`
 
-### 4.2 `agent.Agent` — ReAct 循环（第 1 期基础，第 4.1 期增强）
+### 4.2 `agent.Agent` — ReAct 循环（第 1 期基础，第 4.1/10 期增强）
 
 - 文件：`src/main/java/com/paicli/agent/Agent.java`
 - 职责：维护 `conversationHistory`，循环调用 LLM 直到无工具调用或达到 `MAX_ITERATIONS=10`
@@ -240,8 +258,14 @@ paicli/
   - `flushPending()`：工具调用前刷出缓冲区中间文本，防止延迟显示
   - `hasStreamedOutput()` → 流式输出后返回空字符串，避免重复
   - SLF4J 日志埋点（工具调用、token 用量、异常）
+- **第 10 期增强（CDP 会话复用）**：
+  - SYSTEM_PROMPT 新增 MCP 工具说明（`mcp__{server}__{tool}`）、浏览器策略（登录态检测/shared 模式规则）、网页内容获取策略（snapshot/fill_form/wait_for 优先级）
+  - `save_memory` 工具描述 + LLM 自动调用 `browser_connect` 的引导
+  - 构造器注入 `memorySaver`（`memoryManager::storeFact`）
+  - `storeExplicitBrowserMemoryHint()`：每轮用户输入时调用 `ExplicitMemoryHints.browserLoginFact()` 自动识别浏览器偏好
+  - 工具标签渲染：`save_memory` → "💾 保存长期记忆 N 条"
 - 系统提示词硬编码在 `SYSTEM_PROMPT` 常量里，第 19 期会迁移到 `src/main/resources/prompts/` 分层架构
-- 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 5 节
+- 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 5 节 + `docs/Chapter10-CDP开发.md`
 
 ### 4.3 `llm` 包 — LLM 客户端（第 1 期基础，第 4.1/7.1 期增强）
 
@@ -267,10 +291,10 @@ paicli/
 - 第 8 期会抽象出 `LlmClient` 接口与 `AbstractOpenAiCompatibleClient` 基类，届时 GLMClient 会瘦身为子类
 - 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 2 节
 
-### 4.4 `tool.ToolRegistry` — 工具注册表（第 1 期基础，第 4/7/8 期增强）
+### 4.4 `tool.ToolRegistry` — 工具注册表（第 1 期基础，第 4/7/8/10 期增强）
 
 - 文件：`src/main/java/com/paicli/tool/ToolRegistry.java`
-- 8 个内置工具：
+- 12 个内置工具：
   | 工具名 | 参数 | 用途 | 期次 |
   |---|---|---|---|
   | `read_file` | `path` | 读取文件 | 1 |
@@ -281,12 +305,23 @@ paicli/
   | `search_code` | `query`, `top_k` | 语义检索代码库（混合检索） | 4 |
   | `web_search` | `query`, `top_k` | 联网搜索（智谱 Web Search，复用 GLM_API_KEY） | 8 |
   | `web_fetch` | `url`, `max_chars` | 抓取 URL 提取正文 Markdown | 8 |
+  | `browser_connect` | — | Agent 自动连接已登录 Chrome | 10 |
+  | `browser_disconnect` | — | Agent 切回 isolated 浏览器模式 | 10 |
+  | `browser_status` | — | Agent 查看浏览器连接状态 | 10 |
+  | `save_memory` | `fact` | LLM 保存长期记忆（"记一下/记住"时调用） | 10 |
 - 关键设计：
   - `Tool` record 含 `executor`（函数式接口 `ToolExecutor`），注册时用 lambda 提供执行逻辑
   - `createParameters(Param...)` 动态生成 JSON Schema（type/description/required），传给 LLM
   - `getToolDefinitions()` 剥离 executor，只把 name/description/parameters 暴露给 LLM
   - `executeTool(name, argumentsJson)` 用 Jackson 解析参数 → `Map<String,String>` → 调 executor
-- **已知限制**：参数值用 `asText()` 强转字符串，嵌套对象/数组会丢结构（当前工具都是字符串/数字参数，不受影响；扩展时需改这里）
+- **第 10 期增强（CDP 会话复用）**：
+  - `browserGuard` 字段：注入 `BrowserGuard` 实例，MCP 工具执行前检查浏览器策略
+  - `checkBrowserTool(name, argsJson, previewOnly)`：封装 browser guard 检查
+  - `browserConnector` 字段：Agent 可通过 `browser_connect/disconnect/status` 工具管理浏览器
+  - `memorySaver` 字段：`Consumer<String>` 函数式接口，Agent 可通过 `save_memory` 工具写入长期记忆
+  - `registerBrowserTools()` / `registerMemoryTools()`：注册新增的 4 个工具
+  - `executeTool()` 中 MCP 工具执行前 → `checkBrowserTool()` 拦截；执行后 → `browserGuard.applyAfterExecution()` 更新状态
+  - 审计记录全部传递 `BrowserAuditMetadata`（mode / sensitive / targetUrl）
 
 ### 4.5 `agent.PlanExecuteAgent` — Plan-and-Execute 编排（第 2 期基础，第 3/4.1 期增强）
 
@@ -486,7 +521,7 @@ paicli/
   - 核心方法：`append(chunk)` 流式追加 → `flushCompleteLines()` 按行刷出 → `flushPending()` 强制刷出残留文本 → `finish()` 收尾关闭代码块
 - 详见 `docs/chapter4.1-Streaming_and_Log实现.md` 第 3-4 节
 
-### 4.12 `hitl` 包 — HITL 审批系统（第 6 期）
+### 4.12 `hitl` 包 — HITL 审批系统（第 6 期，第 10 期增强）
 
 - 文件：`src/main/java/com/paicli/hitl/` 下 6 个类（见目录树）
 - **整体设计**：
@@ -496,6 +531,12 @@ paicli/
   - `ApprovedAllTools` 在 `/clear` 时自动重置
 - **Agent 集成**：`Agent` 和 `PlanExecuteAgent` 新增接受外部 `ToolRegistry` 的构造器，`Main` 启动时将 `HitlToolRegistry` 注入三个 Agent 模式（ReAct / Plan / Team）
 - **CLI 命令**：`/hitl on|off|status` + `/memory clear`
+- **第 10 期增强（CDP 会话复用）**：
+  - `HitlToolRegistry.executeTool()`：HITL 决策前先调 `checkBrowserTool(previewOnly=true)` 做浏览器 Guard 前置检查
+  - blocked → 交由父类 `executeTool()` 走 `PolicyException`；sensitive → 强制走 `executeAfterExplicitApproval(sensitiveNotice)`
+  - `ApprovalRequest` 新增 `sensitiveNotice` 字段：审批框展示"敏感页面"提示行
+  - `TerminalHitlHandler`：敏感页面操作隐藏 `[a] 全部放行` 选项（只显示 y/n/s/m），输入 `a` 时提示"敏感页面操作不支持全部放行"
+  - `clearApprovedAllForServer(serverName)`：模式切换时清理旧审批状态
 - **与流式输出的协同**：`StreamRenderer.resetBetweenIterations()` 在工具调用前 flush 并重置渲染器，避免 Markdown pending 文本被 HITL 提示"跨过"
 
 ### 4.13 `resources/logback.xml` — 日志配置（第 4.1 期新增）
@@ -646,6 +687,47 @@ paicli/
 - **Agent 集成**：ReAct / Plan / Team 三个 Agent 的 while 循环开始处均检查 `CancellationContext.isCancelled()`，返回 `"⏹️ 任务已取消"`
 - **CLI 集成**：`/cancel` 命令 + `Main.runTaskWithCancel()` 中 `startRun()` / `clear()` 包裹
 
+### 4.19 `browser` 包 — CDP 浏览器会话管理（第 10 期新增）
+
+- 文件：`src/main/java/com/paicli/browser/` 下 8 个类（见目录树）
+- **整体设计**：
+  - 双模式浏览器架构：`ISOLATED`（临时 user-data-dir，默认）和 `SHARED`（复用已登录 Chrome）
+  - 模式切换通过 `McpServerManager.restartWithArgs()` 动态替换 chrome-devtools MCP server 启动参数实现
+  - `BrowserGuard` 在 MCP 工具执行链路中拦截浏览器操作，强制执行安全策略
+  - `/browser` CLI 命令组：`status` / `connect`（autoConnect 或 port）/ `disconnect` / `tabs`
+- **核心类**：
+
+| 类 | 职责 |
+|---|---|
+| `BrowserMode` | ISOLATED / SHARED 枚举 |
+| `BrowserSession` | 线程安全会话状态（mode / browserUrl / lastNavigatedUrl）+ Agent 打开的 Tab 跟踪 |
+| `BrowserGuard` | 浏览器操作策略执行器：check() 三条判定（close_page 保护 → 敏感页面审批 → 正常放行）+ applyAfterExecution() 状态变更 |
+| `SensitivePagePolicy` | 敏感页面 URL glob → regex 匹配（14 条默认规则：银行/支付/GitHub Settings/飞书后台/云控制台）+ `~/.paicli/sensitive_patterns.txt` 扩展 |
+| `BrowserConnectivityCheck` | CDP 端口探活：HTTP GET `/json/version`（2 秒超时） |
+| `BrowserCheckResult` | 策略检查结果 record（blocked / requiresPerCallApproval / sensitiveNotice / metadata） |
+| `BrowserAuditMetadata` | 审计元数据 record（browserMode / sensitive / targetUrl） |
+| `BrowserConnector` | Agent 可调用的浏览器连接接口（status / connectDefault / disconnect） |
+
+- **敏感页面保护规则**：
+  - `*://*.bank.*/*`、`*://*.alipay.com/*`、`*://*.paypal.com/*`、`*://*.stripe.com/*`
+  - `*://github.com/settings/*`（包括 org 级别的 settings）
+  - `*://*.feishu.cn/admin/*`、`*://*.larksuite.com/admin/*`
+  - `*://*.console.cloud.google.com/*`、`*://*.console.aws.amazon.com/*`、`*://*.portal.azure.com/*`
+  - 命中规则的 click / fill / fill_form / evaluate_script 等写入工具强制单步 HITL
+- **审计集成**：`AuditLog.AuditEntry` 新增 `metadata` 字段 + `@JsonIgnoreProperties(ignoreUnknown = true)` 向前兼容
+- **McpServerManager 增强**：新增 `restartWithArgs(name, args)`（动态替换启动参数后重启）+ `server(name)` 查询方法
+- 详见 `docs/Chapter10-CDP开发.md`
+
+### 4.20 `memory.ExplicitMemoryHints` — 显式记忆提示（第 10 期新增）
+
+- 文件：`src/main/java/com/paicli/memory/ExplicitMemoryHints.java`
+- 职责：从用户输入中自动识别"记住 + 浏览器登录复用"意图，提炼为长期记忆事实
+- **识别逻辑**：
+  1. 用户输入包含记忆意图关键词（"记一下"、"记住"、"以后记得"等）
+  2. 同时提及浏览器登录复用（chrome/浏览器 + 登录态/复用/连接）
+  3. 从上下文提取 URL host → 生成精确事实（如"访问 yuque.com（语雀）时优先复用用户已登录的 Chrome 登录态。"）
+- **Agent 集成**：`Agent.run()` 中每轮用户输入时调用 `storeExplicitBrowserMemoryHint()` → `ExplicitMemoryHints.browserLoginFact()` → `memoryManager.storeFact()`
+
 ---
 
 ## 5. 开发与运行
@@ -694,7 +776,7 @@ java -jar target/paicli-0.0.1-SNAPSHOT.jar
 | 9 | MCP 协议核心 | `JsonRpcClient` / `McpTransport` / `McpServerManager` / `McpClient` / `McpServer` + config + protocol records | 已完成 → [4.16](#416-mcp-包--mcp-协议集成第-9–11-期) + `docs/Chapter9-MCP开发.md` |
 | 10–11 | MCP 高级 + Chrome DevTools + 长上下文 | `McpResourceCache` / `McpResourceTool` / `AtMentionParser` / `NotificationRouter` / `CancellationContext` / `ContextProfile` / `TokenUsageFormatter` / HITL server 全放行 | 已完成 → [4.16](#416-mcp-包--mcp-协议集成第-9–11-期) + [4.17](#417-context-包--上下文策略第-11-期) + [4.18](#418-runtime-包--运行时取消第-10-期) |
 | 12 | 长上下文 | `AgentBudget` / `ContextProfile` | 已完成 ↑（合并入第 11 期） |
-| 13–14 | Chrome DevTools MCP | 浏览器接入 | 已完成 ↑（合并入第 11 期） |
+| 13–14 | Chrome DevTools MCP + CDP 会话复用 | `BrowserSession` / `BrowserGuard` / `SensitivePagePolicy` / `BrowserConnectivityCheck` / `BrowserConnector` / `ExplicitMemoryHints` / `PaiCliCompleter` | 已完成 → [4.19](#419-browser-包--cdp-浏览器会话管理第-10-期新增) + [4.20](#420-memoryexplicitmemoryhints--显式记忆提示第-10-期新增) + `docs/Chapter10-CDP开发.md` |
 | 15 | Skill 系统 | `SkillLoader` / `SkillContextBuffer` | 未开始 |
 | 16 | TUI 产品化 | `Renderer` 接口 + inline/lanterna/plain 三实现 | 未开始 |
 | 17 | LSP 诊断 | `LspManager` / `LspHooks` | 未开始 |
