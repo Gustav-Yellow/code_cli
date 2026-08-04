@@ -141,11 +141,16 @@ public class PlanExecuteAgent {
             6. search_code - 语义检索代码库，参数：{"query": "自然语言描述", "top_k": 5}
             7. web_search - 搜索互联网获取实时信息，参数：{"query": "搜索关键词", "top_k": 5}
             8. web_fetch - 抓取已知 URL 并返回正文 Markdown，参数：{"url": "https://...", "max_chars": 8000}
+            9. mcp__{server}__{tool} - MCP server 动态提供的外部工具，具体参数以工具 schema 为准
 
             如果任务涉及理解代码库（如分析代码结构、查找实现位置），请优先使用 search_code 工具。
             如果任务需要实时互联网信息（如查询框架最新版本、官方文档），请使用 web_search 找入口，
             拿到具体 URL 后用 web_fetch 抓取全文。已经有 URL 时直接 web_fetch，不要再 web_search 一次。
             web_fetch 拿到空正文（SPA / 防爬墙）时，明确告知用户这是已知边界，不要反复重试。
+            微信公众号文章 (mp.weixin.qq.com)、知乎专栏、推特、小红书等站点 web_fetch 通常拿不到正文，应走浏览器 MCP。
+            浏览器操作优先 mcp__chrome-devtools__take_snapshot（结构化 DOM 文本），不要默认 take_screenshot；
+            表单填写优先 fill_form，等待异步加载用 wait_for，控制台排查用 list_console_messages，网络排查用 list_network_requests + get_network_request。
+            需要带登录态的调试 Chrome 但拿到登录页时，提示用户先启动 9222 调试端口并执行 /browser connect；shared 模式下敏感页面改写操作会强制单步 HITL，close_page 只能关 PaiCLI 自己创建的 tab。
             对于当前项目内的文件，请优先使用 read_file 或 list_dir，不要用 execute_command 扫描 /、~ 或整个文件系统。
             execute_command 只适合在当前项目目录执行短时命令。
             安全策略硬规则（HITL 之外的兜底，无法绕过）：read_file / write_file / list_dir / create_project 必须在项目根之内；write_file 单文件 5MB 上限；

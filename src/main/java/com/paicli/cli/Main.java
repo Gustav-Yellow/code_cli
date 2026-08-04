@@ -3,13 +3,21 @@ package com.paicli.cli;
 import com.paicli.agent.Agent;
 import com.paicli.agent.AgentOrchestrator;
 import com.paicli.agent.PlanExecuteAgent;
+import com.paicli.browser.BrowserAuditMetadata;
+import com.paicli.browser.BrowserConnectivityCheck;
+import com.paicli.browser.BrowserGuard;
+import com.paicli.browser.BrowserMode;
+import com.paicli.browser.BrowserSession;
+import com.paicli.browser.SensitivePagePolicy;
 import com.paicli.config.PaiCliConfig;
 import com.paicli.hitl.ApprovalPolicy;
 import com.paicli.hitl.HitlToolRegistry;
 import com.paicli.hitl.TerminalHitlHandler;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmClientFactory;
+import com.paicli.mcp.McpServer;
 import com.paicli.mcp.McpServerManager;
+import com.paicli.mcp.McpServerStatus;
 import com.paicli.mcp.mention.AtMentionCompleter;
 import com.paicli.mcp.mention.AtMentionExpander;
 import com.paicli.policy.AuditLog;
@@ -38,12 +46,13 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * PaiCLI v10.0.0 - Browser-Capable Agent CLI
+ * PaiCLI v14.0.0 - Session-Aware Browser Agent CLI
  * 支持 ReAct、Plan-and-Execute、Memory、RAG、Multi-Agent、HITL、并行工具调用、多模型切换、MCP
- * 第 11 期新增：默认接入 chrome-devtools MCP server、HITL 按 MCP server 全放行、长上下文策略
+ * 第 14 期新增：CDP 会话复用、/browser 命令组、敏感页面单步审批、shared 模式 close_page 保护
+ * HITL 增强：路径围栏（PathGuard）、命令快速拒绝（CommandGuard）、操作审计链（AuditLog）—— 见 com.paicli.policy
  */
 public class Main {
-    private static final String VERSION = "10.0.0";
+    private static final String VERSION = "14.0.0";
     private static final String ENV_FILE = ".env";
     private static final String LOG_DIR_PROPERTY = "paicli.log.dir";
     private static final String LOG_LEVEL_PROPERTY = "paicli.log.level";
@@ -163,6 +172,9 @@ public class Main {
             // 创建 HITL 处理器（默认关闭）
             TerminalHitlHandler hitlHandler = new TerminalHitlHandler(false);
             HitlToolRegistry hitlToolRegistry = new HitlToolRegistry(hitlHandler);
+            BrowserSession browserSession = new BrowserSession();
+            BrowserConnectivityCheck browserConnectivityCheck = new BrowserConnectivityCheck();
+            hitlToolRegistry.setBrowserGuard(new BrowserGuard(browserSession, new SensitivePagePolicy()));
 
             // 初始化 MCP 子系统
             McpServerManager mcpServerManager = new McpServerManager(hitlToolRegistry, Path.of("."));
@@ -205,6 +217,9 @@ public class Main {
             System.out.println("   - 输入 '/hitl on' 启用危险操作人工审批（HITL）");
             System.out.println("   - 输入 '/hitl off' 关闭 HITL 审批");
             System.out.println("   - 输入 '/mcp' 查看 MCP server，'/mcp restart|logs|disable|enable <name>' 管理 MCP");
+            System.out.println("   - 输入 '/mcp restart chrome-devtools' 重启浏览器 MCP server");
+            System.out.println("   - 输入 '/browser connect' 复用带登录态的调试 Chrome（需先用 9222 调试端口启动 Chrome）");
+            System.out.println("   - 输入 '/browser status|tabs|disconnect' 查看或切回 isolated 浏览器模式");
             System.out.println("   - 输入 '/context' 查看上下文和记忆状态");
             System.out.println("   - 输入 '/memory' 查看记忆状态");
             System.out.println("   - 输入 '/memory clear' 清空长期记忆");
@@ -245,7 +260,7 @@ public class Main {
                 switch (command.type()) {
                     case UNKNOWN_COMMAND -> {
                         System.out.println("❌ 未知命令: " + command.payload());
-                        System.out.println("可用命令：/model /plan /team /hitl /mcp /policy /audit /clear /cancel /context /memory /memory clear /save /index /search /graph /exit\n");
+                        System.out.println("可用命令：/model /plan /team /hitl /browser /mcp /policy /audit /clear /cancel /context /memory /memory clear /save /index /search /graph /exit\n");
                         continue;
                     }
                     case EXIT -> {
@@ -299,6 +314,16 @@ public class Main {
                     }
                     case MCP_PROMPTS -> {
                         printMcpCommandResult(mcpServerManager.prompts(command.payload()));
+                        continue;
+                    }
+                    case BROWSER -> {
+                        printMcpCommandResult(handleBrowserCommand(
+                                command.payload(),
+                                browserSession,
+                                browserConnectivityCheck,
+                                mcpServerManager,
+                                hitlToolRegistry,
+                                hitlHandler));
                         continue;
                     }
                     case CANCEL -> {
@@ -816,27 +841,155 @@ public class Main {
                 "输入 '/plan' 后，下一条任务使用 Plan-and-Execute 模式",
                 "输入 '/plan 任务内容' 直接用计划模式执行这条任务",
                 "计划生成后可直接执行、补充要求重规划，或取消",
-                "输入 '/index [路径]' 为代码库建立向量索引",
-                "输入 '/search <查询>' 语义检索代码",
-                "输入 '/graph <类名>' 查看代码关系图谱",
                 "输入 '/team' 后，下一条任务使用 Multi-Agent 协作模式",
                 "输入 '/team 任务内容' 直接用多 Agent 协作执行这条任务",
                 "默认模式是 ReAct",
                 "输入 '/hitl on' 启用危险操作人工审批（HITL）",
                 "输入 '/hitl off' 关闭 HITL 审批",
                 "输入 '/mcp' 查看 MCP server，'/mcp restart|logs|disable|enable <name>' 管理 MCP",
+                "输入 '/mcp restart chrome-devtools' 重启浏览器 MCP server",
                 "输入 '/mcp resources <server>' 查看 server 暴露的 resources",
                 "输入 '/mcp prompts <server>' 查看 server 暴露的 prompts",
+                "输入 '/browser connect' 复用带登录态的调试 Chrome（需先用 9222 调试端口启动 Chrome）",
+                "输入 '/browser status|tabs|disconnect' 查看或切回 isolated 浏览器模式",
                 "输入 '/cancel' 取消当前正在运行的 Agent 任务",
                 "输入 '@server:protocol://path' 引用 MCP resource（输入时 Tab 可自动补全）",
                 "输入 '/policy' 查看安全策略状态（路径围栏 / 命令黑名单 / 资源上限）",
                 "输入 '/audit [N]' 查看最近 N 条危险工具审计记录（默认 10）",
+                "输入 '/index [路径]' 为代码库建立向量索引",
+                "输入 '/search <查询>' 语义检索代码",
+                "输入 '/graph <类名>' 查看代码关系图谱",
                 "输入 '/clear' 清空对话历史",
+                "输入 '/context' 查看上下文和记忆状态",
                 "输入 '/memory' 查看记忆状态",
                 "输入 '/memory clear' 清空长期记忆",
                 "输入 '/save 事实内容' 手动保存关键事实",
                 "输入 '/exit' 或 '/quit' 退出"
         );
+    }
+
+    static String handleBrowserCommand(String payload,
+                                       BrowserSession browserSession,
+                                       BrowserConnectivityCheck connectivityCheck,
+                                       McpServerManager mcpServerManager,
+                                       HitlToolRegistry registry,
+                                       TerminalHitlHandler hitlHandler) {
+        String normalized = payload == null || payload.isBlank() ? "status" : payload.trim();
+        String[] parts = normalized.split("\\s+");
+        String subCommand = parts[0].toLowerCase();
+        return switch (subCommand) {
+            case "status" -> browserStatus(browserSession, connectivityCheck, mcpServerManager);
+            case "connect" -> {
+                int port = parseBrowserPort(parts.length >= 2 ? parts[1] : null);
+                yield browserConnect(port, browserSession, connectivityCheck, mcpServerManager, hitlHandler);
+            }
+            case "disconnect" -> browserDisconnect(browserSession, mcpServerManager, hitlHandler);
+            case "tabs" -> browserTabs(browserSession, registry);
+            default -> """
+                    ❌ 未知 /browser 子命令: %s
+                    可用命令：
+                      /browser status
+                      /browser connect [port]
+                      /browser disconnect
+                      /browser tabs
+                    """.formatted(normalized).trim();
+        };
+    }
+
+    private static String browserStatus(BrowserSession browserSession,
+                                        BrowserConnectivityCheck connectivityCheck,
+                                        McpServerManager mcpServerManager) {
+        BrowserConnectivityCheck.ProbeResult probe = connectivityCheck.probe(9222);
+        McpServer server = mcpServerManager.server("chrome-devtools");
+        String serverStatus = server == null
+                ? "未配置"
+                : server.status() == McpServerStatus.READY
+                ? "● ready (" + server.tools().size() + " tools)"
+                : server.status().name().toLowerCase() + (server.errorMessage() == null ? "" : " - " + server.errorMessage());
+        String mode = browserSession.mode() == BrowserMode.SHARED
+                ? "shared（复用 " + browserSession.browserUrl() + "）"
+                : "isolated（临时 user-data-dir，无登录态）";
+        return """
+                🌐 浏览器会话
+                  当前模式: %s
+                  chrome-devtools server: %s
+                  9222 探活: %s
+                """.formatted(mode, serverStatus, probe.ok() ? "✅ " + probe.browserUrl() : "⚠️ " + probe.message()).trim();
+    }
+
+    private static String browserConnect(int port,
+                                         BrowserSession browserSession,
+                                         BrowserConnectivityCheck connectivityCheck,
+                                         McpServerManager mcpServerManager,
+                                         TerminalHitlHandler hitlHandler) {
+        if (port < 1024 || port > 65535) {
+            return "❌ /browser connect 端口必须在 1024-65535 之间，默认可直接使用 /browser connect（9222）。";
+        }
+        BrowserConnectivityCheck.ProbeResult probe = connectivityCheck.probe(port);
+        if (!probe.ok()) {
+            return "❌ 未检测到 Chrome 调试端口 127.0.0.1:" + port + "：" + probe.message() + "\n\n"
+                    + chromeLaunchHelp(port);
+        }
+
+        McpServer server = mcpServerManager.server("chrome-devtools");
+        if (server == null) {
+            return "❌ 未配置 chrome-devtools MCP server，请先检查 ~/.paicli/mcp.json";
+        }
+        List<String> oldArgs = List.copyOf(server.config().getArgs());
+        List<String> sharedArgs = List.of("-y", "chrome-devtools-mcp@latest", "--browser-url=" + probe.browserUrl());
+        String result = mcpServerManager.restartWithArgs("chrome-devtools", sharedArgs);
+        McpServer restarted = mcpServerManager.server("chrome-devtools");
+        if (restarted != null && restarted.status() == McpServerStatus.READY) {
+            browserSession.switchToShared(probe.browserUrl());
+            hitlHandler.clearApprovedAllForServer("chrome-devtools");
+            return "🔄 切换 chrome-devtools server 到 shared 模式 (" + probe.browserUrl() + ")\n" + result;
+        }
+        mcpServerManager.restartWithArgs("chrome-devtools", oldArgs);
+        return "❌ shared 模式切换失败，已回滚 chrome-devtools 启动参数：\n" + result;
+    }
+
+    private static String browserDisconnect(BrowserSession browserSession,
+                                            McpServerManager mcpServerManager,
+                                            TerminalHitlHandler hitlHandler) {
+        McpServer server = mcpServerManager.server("chrome-devtools");
+        if (server == null) {
+            browserSession.switchToIsolated();
+            return "❌ 未配置 chrome-devtools MCP server，已清理本地浏览器会话状态";
+        }
+        String result = mcpServerManager.restartWithArgs(
+                "chrome-devtools",
+                List.of("-y", "chrome-devtools-mcp@latest", "--isolated=true"));
+        browserSession.switchToIsolated();
+        hitlHandler.clearApprovedAllForServer("chrome-devtools");
+        return "🔄 已切回 isolated 浏览器模式\n" + result;
+    }
+
+    private static String browserTabs(BrowserSession browserSession, HitlToolRegistry registry) {
+        if (browserSession.mode() != BrowserMode.SHARED) {
+            return "当前为 isolated 模式，没有真实 Chrome tab 可复用。可用 /browser connect 切到 shared 模式。";
+        }
+        return registry.executeTool("mcp__chrome-devtools__list_pages", "{}");
+    }
+
+    private static int parseBrowserPort(String value) {
+        if (value == null || value.isBlank()) {
+            return 9222;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private static String chromeLaunchHelp(int port) {
+        return """
+                请先用调试端口启动 Chrome：
+                  macOS: open -na "Google Chrome" --args --remote-debugging-port=%d --user-data-dir=/tmp/paicli-chrome-profile
+                  Windows: start chrome.exe --remote-debugging-port=%d --user-data-dir=%%TEMP%%\\paicli-chrome-profile
+                  Linux: google-chrome --remote-debugging-port=%d --user-data-dir=/tmp/paicli-chrome-profile
+                然后重新执行 /browser connect %d
+                """.formatted(port, port, port, port).trim();
     }
 
     private static void printPolicyStatus(Agent reactAgent) {
@@ -873,6 +1026,12 @@ public class Main {
                     entry.approver());
             if (entry.reason() != null && !entry.reason().isBlank()) {
                 System.out.println("        原因: " + entry.reason());
+            }
+            BrowserAuditMetadata metadata = entry.metadata();
+            if (metadata != null) {
+                System.out.println("        浏览器: mode=" + metadata.browserMode()
+                        + ", sensitive=" + metadata.sensitive()
+                        + (metadata.targetUrl() == null ? "" : ", url=" + metadata.targetUrl()));
             }
         }
         System.out.println();
@@ -1172,7 +1331,7 @@ public class Main {
         System.out.println("║   ██║     ██║  ██║██║╚██████╗███████╗██║                ║");
         System.out.println("║   ╚═╝     ╚═╝  ╚═╝╚═╝ ╚═════╝╚══════╝╚═╝                ║");
         System.out.println("║                                                          ║");
-        System.out.printf("║      Browser-Capable Agent CLI %-24s║%n", "v" + VERSION);
+        System.out.printf("║      Session-Aware Browser Agent CLI %-17s║%n", "v" + VERSION);
         System.out.println("║                                                          ║");
         System.out.println("╚══════════════════════════════════════════════════════════╝");
         System.out.println();

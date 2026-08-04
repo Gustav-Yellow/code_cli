@@ -1,5 +1,6 @@
 package com.paicli.hitl;
 
+import com.paicli.browser.BrowserCheckResult;
 import com.paicli.policy.AuditLog;
 import com.paicli.tool.ToolRegistry;
 
@@ -31,15 +32,27 @@ public class HitlToolRegistry extends ToolRegistry {
         if (!hitlHandler.isEnabled() || !ApprovalPolicy.requiresApproval(name)) {
             return super.executeTool(name, argumentsJson);
         }
+        // 浏览器 Guard 前置检查：blocked → 交给父类正常执行（executeTool 会走 PolicyException）
+        BrowserCheckResult browserCheck = checkBrowserTool(name, argumentsJson, true);
+        if (browserCheck.blocked()) {
+            return super.executeTool(name, argumentsJson);
+        }
+        // 敏感页面改写操作 → 强制单步 HITL（不允许复用全放行）
+        if (browserCheck.requiresPerCallApproval()) {
+            return executeAfterExplicitApproval(name, argumentsJson, browserCheck.sensitiveNotice());
+        }
         // 已在本次会话中全放行（工具维度或 server 维度），跳过审批
         String mcpServer = ApprovalPolicy.mcpServerName(name);
         if (hitlHandler.isApprovedAllByTool(name) || hitlHandler.isApprovedAllByServer(mcpServer)) {
             return super.executeTool(name, argumentsJson);
         }
 
+        return executeAfterExplicitApproval(name, argumentsJson, null);
+    }
+
+    private String executeAfterExplicitApproval(String name, String argumentsJson, String sensitiveNotice) {
         long start = System.nanoTime();
-        // 构建审批请求并发起审批
-        ApprovalRequest request = ApprovalRequest.of(name, argumentsJson, null);
+        ApprovalRequest request = ApprovalRequest.of(name, argumentsJson, null, null, sensitiveNotice);
         ApprovalResult result = hitlHandler.requestApproval(request);
 
         if (result.isRejected()) {

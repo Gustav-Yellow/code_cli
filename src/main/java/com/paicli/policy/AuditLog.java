@@ -1,7 +1,9 @@
 package com.paicli.policy;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.paicli.browser.BrowserAuditMetadata;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -130,6 +132,7 @@ public class AuditLog {
         return s.length() <= MAX_FIELD_CHARS ? s : s.substring(0, MAX_FIELD_CHARS) + "...(truncated)";
     }
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public record AuditEntry(
             String timestamp,
             String tool,
@@ -137,32 +140,50 @@ public class AuditLog {
             String outcome,
             String reason,
             String approver,
-            long durationMs
+            long durationMs,
+            BrowserAuditMetadata metadata
     ) {
         public static AuditEntry allow(String tool, String args, long durationMs) {
             return new AuditEntry(Instant.now().toString(), tool, truncate(args),
-                    OUTCOME_ALLOW, null, APPROVER_NONE, durationMs);
+                    OUTCOME_ALLOW, null, APPROVER_NONE, durationMs, null);
+        }
+
+        public static AuditEntry allow(String tool, String args, long durationMs, BrowserAuditMetadata metadata) {
+            return new AuditEntry(Instant.now().toString(), tool, truncate(args),
+                    OUTCOME_ALLOW, null, APPROVER_NONE, durationMs, metadata);
         }
 
         public static AuditEntry denyByHitl(String tool, String args, String reason, long durationMs) {
             return new AuditEntry(Instant.now().toString(), tool, truncate(args),
-                    OUTCOME_DENY, reason, APPROVER_HITL, durationMs);
+                    OUTCOME_DENY, reason, APPROVER_HITL, durationMs, null);
         }
 
         public static AuditEntry denyByPolicy(String tool, String args, String reason, long durationMs) {
             return new AuditEntry(Instant.now().toString(), tool, truncate(args),
-                    OUTCOME_DENY, reason, APPROVER_POLICY, durationMs);
+                    OUTCOME_DENY, reason, APPROVER_POLICY, durationMs, null);
+        }
+
+        public static AuditEntry denyByPolicy(String tool, String args, String reason, long durationMs,
+                                              BrowserAuditMetadata metadata) {
+            return new AuditEntry(Instant.now().toString(), tool, truncate(args),
+                    OUTCOME_DENY, reason, APPROVER_POLICY, durationMs, metadata);
         }
 
         public static AuditEntry error(String tool, String args, String reason, long durationMs) {
             return new AuditEntry(Instant.now().toString(), tool, truncate(args),
-                    OUTCOME_ERROR, reason, APPROVER_NONE, durationMs);
+                    OUTCOME_ERROR, reason, APPROVER_NONE, durationMs, null);
+        }
+
+        public static AuditEntry error(String tool, String args, String reason, long durationMs,
+                                       BrowserAuditMetadata metadata) {
+            return new AuditEntry(Instant.now().toString(), tool, truncate(args),
+                    OUTCOME_ERROR, reason, APPROVER_NONE, durationMs, metadata);
         }
 
         /** @-mention 触发的 resource 读取审计记录（approver=none，由系统自动触发） */
         public static AuditEntry allowByMention(String tool, String args, long durationMs) {
             return new AuditEntry(Instant.now().toString(), tool, truncate(args),
-                    OUTCOME_ALLOW, null, "mention", durationMs);
+                    OUTCOME_ALLOW, null, "mention", durationMs, null);
         }
     }
 }

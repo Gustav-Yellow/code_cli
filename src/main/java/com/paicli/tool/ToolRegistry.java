@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.paicli.browser.BrowserAuditMetadata;
+import com.paicli.browser.BrowserCheckResult;
+import com.paicli.browser.BrowserGuard;
 import com.paicli.context.ContextProfile;
 import com.paicli.llm.LlmClient;
 import com.paicli.rag.CodeRetriever;
@@ -76,6 +79,7 @@ public class ToolRegistry {
     private HtmlExtractor htmlExtractor;
     private NetworkPolicy networkPolicy;
     private ContextProfile contextProfile = ContextProfile.from(null);
+    private BrowserGuard browserGuard;
 
     public ToolRegistry() {
         this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS);
@@ -120,6 +124,14 @@ public class ToolRegistry {
 
     public ContextProfile getContextProfile() {
         return contextProfile;
+    }
+
+    public void setBrowserGuard(BrowserGuard browserGuard) {
+        this.browserGuard = browserGuard;
+    }
+
+    protected BrowserGuard getBrowserGuard() {
+        return browserGuard;
     }
 
     /**
@@ -570,36 +582,35 @@ public class ToolRegistry {
      * </ul>
      */
     public String executeTool(String name, String argumentsJson) {
-        // 步骤0：MCP 工具走独立执行路径（不经过 Map<String,String> 解析）
-        McpRegisteredTool mcpTool = mcpTools.get(name);
-        if (mcpTool != null) {
-            boolean shouldAudit = shouldAudit(name);
-            long start = System.nanoTime();
-            try {
-                String result = mcpTool.invoker().apply(argumentsJson);
-                if (shouldAudit) {
-                    auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start)));
-                }
-                return result;
-            } catch (Exception e) {
-                if (shouldAudit) {
-                    auditLog.record(AuditLog.AuditEntry.error(
-                            name, argumentsJson, e.getMessage(), elapsedMillis(start)));
-                }
-                return "工具执行失败: " + e.getMessage();
-            }
-        }
-
-        // 步骤1：查找工具
-        Tool tool = tools.get(name);
-        if (tool == null) {
-            return "未知工具: " + name;
-        }
-
         boolean shouldAudit = shouldAudit(name);
         long start = System.nanoTime();
+        BrowserAuditMetadata auditMetadata = null;
 
         try {
+            // 步骤0：MCP 工具走独立执行路径（不经过 Map<String,String> 解析）
+            McpRegisteredTool mcpTool = mcpTools.get(name);
+            if (mcpTool != null) {
+                BrowserCheckResult browserCheck = checkBrowserTool(name, argumentsJson, false);
+                auditMetadata = browserCheck.metadata();
+                if (browserCheck.blocked()) {
+                    throw new PolicyException(browserCheck.reason());
+                }
+                String result = mcpTool.invoker().apply(argumentsJson);
+                if (browserGuard != null) {
+                    browserGuard.applyAfterExecution(name, argumentsJson, result);
+                }
+                if (shouldAudit) {
+                    auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start), auditMetadata));
+                }
+                return result;
+            }
+
+            // 步骤1：查找工具
+            Tool tool = tools.get(name);
+            if (tool == null) {
+                return "未知工具: " + name;
+            }
+
             // 步骤2：解析 argumentsJson 为 JsonNode
             JsonNode args = mapper.readTree(argumentsJson);
             // 步骤3：转 Map<String,String>（注意 asText() 的限制：对象/数组会丢失结构）
@@ -609,20 +620,20 @@ public class ToolRegistry {
             // 步骤4：调用工具的 executor（注册时传入的 lambda），返回执行结果
             String result = tool.executor().execute(argMap);
             if (shouldAudit) {
-                auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start)));
+                auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start), auditMetadata));
             }
             return result;
         } catch (PolicyException e) {
             if (shouldAudit) {
                 auditLog.record(AuditLog.AuditEntry.denyByPolicy(
-                        name, argumentsJson, e.getMessage(), elapsedMillis(start)));
+                        name, argumentsJson, e.getMessage(), elapsedMillis(start), auditMetadata));
             }
             return "🛡️ 策略拒绝: " + e.getMessage();
         } catch (Exception e) {
             // 步骤5：解析或执行失败时的兜底返回
             if (shouldAudit) {
                 auditLog.record(AuditLog.AuditEntry.error(
-                        name, argumentsJson, e.getMessage(), elapsedMillis(start)));
+                        name, argumentsJson, e.getMessage(), elapsedMillis(start), auditMetadata));
             }
             return "工具执行失败: " + e.getMessage();
         }
@@ -630,6 +641,13 @@ public class ToolRegistry {
 
     public AuditLog getAuditLog() {
         return auditLog;
+    }
+
+    protected BrowserCheckResult checkBrowserTool(String name, String argumentsJson, boolean previewOnly) {
+        if (browserGuard == null || !BrowserGuard.isChromeTool(name)) {
+            return BrowserCheckResult.allow(null);
+        }
+        return browserGuard.check(name, argumentsJson, !previewOnly);
     }
 
     /**

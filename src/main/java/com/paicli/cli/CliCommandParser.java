@@ -27,6 +27,7 @@ final class CliCommandParser {
         MCP_ENABLE,
         MCP_RESOURCES,
         MCP_PROMPTS,
+        BROWSER,
         CANCEL
     }
 
@@ -150,6 +151,14 @@ final class CliCommandParser {
 
         if (trimmed.regionMatches(true, 0, "/audit ", 0, 7)) {
             return new ParsedCommand(CommandType.AUDIT_TAIL, trimmed.substring(7).trim());
+        }
+
+        if (trimmed.equalsIgnoreCase("/browser")) {
+            return new ParsedCommand(CommandType.BROWSER, "status");
+        }
+
+        if (trimmed.regionMatches(true, 0, "/browser ", 0, 9)) {
+            return new ParsedCommand(CommandType.BROWSER, trimmed.substring(9).trim());
         }
 
         if (trimmed.equalsIgnoreCase("/mcp")) {

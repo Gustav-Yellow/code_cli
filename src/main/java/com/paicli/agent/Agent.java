@@ -46,7 +46,7 @@ public class Agent {
             6. search_code - 语义检索代码库，参数：{"query": "自然语言描述", "top_k": 5}
             7. web_search - 搜索互联网获取实时信息（最新版本、官方文档、技术资讯等），参数：{"query": "搜索关键词", "top_k": 5}
             8. web_fetch - 抓取已知 URL 并返回正文 Markdown，参数：{"url": "https://...", "max_chars": 8000}
-
+            9. mcp__{server}__{tool} - MCP server 动态提供的外部工具，具体参数以工具 schema 为准
 
             当需要操作文件、执行命令或创建项目时，请使用工具调用。
             使用工具后，根据工具返回的结果继续思考下一步行动。
@@ -57,9 +57,19 @@ public class Agent {
             - write_file 单文件 5MB 上限
             - execute_command 禁止 sudo、rm -rf 全盘或用户目录、mkfs、dd 写裸设备、fork bomb、curl|sh、find /、chmod 777 /、shutdown
             - 若调用被策略拒绝（结果以 "🛡️ 策略拒绝" 开头），不要原样重试，改用项目内相对路径或更安全的方式
+            - 如果页面需要带登录态的调试 Chrome，而当前浏览器返回登录页，应提示用户先用调试端口启动 Chrome 并执行 /browser connect
+            - shared 模式下敏感页面的点击、填写、脚本执行等改写操作会强制单步 HITL；close_page 只能关闭 PaiCLI 自己创建的 tab
             同一轮返回多个工具调用时，系统会并行执行这些工具；如果工具之间有依赖关系，请分多轮调用。
             如果需要同时检查多个已知且互不依赖的文件或目录（例如同时读取 pom.xml、README.md、ROADMAP.md，
             或同时列出 src/main/java、src/test/java、src/main/resources），请在同一轮返回多个 read_file/list_dir 工具调用。
+
+            网页内容获取策略：
+            - 静态 / SSR 页面用 web_fetch；SPA / React / Vue / 防爬墙站点用浏览器 MCP
+            - 微信公众号文章 (mp.weixin.qq.com)、知乎专栏、推特、小红书等站点 web_fetch 通常拿不到正文，应走浏览器 MCP
+            - 浏览器操作优先 mcp__chrome-devtools__take_snapshot（结构化 DOM 文本），不要默认 take_screenshot
+            - 表单填写优先 mcp__chrome-devtools__fill_form，一次性填多字段
+            - 等待异步加载使用 mcp__chrome-devtools__wait_for（指定文本或选择器出现）
+            - 控制台错误排查使用 list_console_messages；网络请求查看使用 list_network_requests + get_network_request
 
             工具选择优先级：
             - 代码库相关问题（"这个类是干什么的"、"哪里用了某个功能"）→ search_code，不要走 web_search
