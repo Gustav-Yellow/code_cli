@@ -28,6 +28,9 @@ import java.util.function.Consumer;
  */
 public class McpClient implements AutoCloseable {
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final int DEFAULT_INITIALIZE_TIMEOUT_SECONDS = 60;
+    private static final String INITIALIZE_TIMEOUT_PROPERTY = "paicli.mcp.initialize.timeout.seconds";
+    private static final String INITIALIZE_TIMEOUT_ENV = "PAICLI_MCP_INITIALIZE_TIMEOUT_SECONDS";
 
     private final String serverName;
     private final JsonRpcClient rpc;
@@ -42,9 +45,26 @@ public class McpClient implements AutoCloseable {
 
     /** MCP 握手：initialize → 解析 capabilities → initialized 通知 */
     public void initialize() throws IOException {
-        JsonNode result = rpc.request("initialize", McpInitializeRequest.toJson(), 30);
+        JsonNode result = rpc.request("initialize", McpInitializeRequest.toJson(), initializeTimeoutSeconds());
         serverCapabilities = result == null ? JsonNodeFactory.instance.objectNode() : result.path("capabilities");
         rpc.sendNotification("notifications/initialized", JsonNodeFactory.instance.objectNode());
+    }
+
+    /** 从系统属性 / 环境变量读取 initialize 超时（秒），默认 60s（chrome-devtools 首次需 npx 拉包 + Chrome 冷启） */
+    static int initializeTimeoutSeconds() {
+        String configured = System.getProperty(INITIALIZE_TIMEOUT_PROPERTY);
+        if (configured == null || configured.isBlank()) {
+            configured = System.getenv(INITIALIZE_TIMEOUT_ENV);
+        }
+        if (configured == null || configured.isBlank()) {
+            return DEFAULT_INITIALIZE_TIMEOUT_SECONDS;
+        }
+        try {
+            int seconds = Integer.parseInt(configured.trim());
+            return seconds > 0 ? seconds : DEFAULT_INITIALIZE_TIMEOUT_SECONDS;
+        } catch (NumberFormatException ignored) {
+            return DEFAULT_INITIALIZE_TIMEOUT_SECONDS;
+        }
     }
 
     public boolean supportsResources() {

@@ -71,4 +71,17 @@ public class ApprovalPolicy {
     private static boolean isMcpTool(String toolName) {
         return toolName != null && toolName.startsWith("mcp__");
     }
+
+    /**
+     * 从 MCP 工具名中提取 server 名。
+     * 格式: mcp__{server}__{tool} → server；非 MCP 工具返回空字符串。
+     */
+    public static String mcpServerName(String toolName) {
+        if (toolName == null || !toolName.startsWith("mcp__")) {
+            return "";
+        }
+        int start = "mcp__".length();
+        int end = toolName.indexOf("__", start);
+        return end > start ? toolName.substring(start, end) : "";
+    }
 }

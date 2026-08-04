@@ -31,6 +31,11 @@ public class HitlToolRegistry extends ToolRegistry {
         if (!hitlHandler.isEnabled() || !ApprovalPolicy.requiresApproval(name)) {
             return super.executeTool(name, argumentsJson);
         }
+        // 已在本次会话中全放行（工具维度或 server 维度），跳过审批
+        String mcpServer = ApprovalPolicy.mcpServerName(name);
+        if (hitlHandler.isApprovedAllByTool(name) || hitlHandler.isApprovedAllByServer(mcpServer)) {
+            return super.executeTool(name, argumentsJson);
+        }
 
         long start = System.nanoTime();
         // 构建审批请求并发起审批

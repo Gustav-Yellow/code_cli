@@ -29,6 +29,21 @@ public interface LlmClient {
     /** 当前 provider 名称，如 "glm"、"deepseek" */
     String getProviderName();
 
+    /** 模型的最大上下文窗口大小（token 数），用于动态预算和策略派生 */
+    default int maxContextWindow() {
+        return 128_000;
+    }
+
+    /** 模型是否支持 prompt caching */
+    default boolean supportsPromptCaching() {
+        return false;
+    }
+
+    /** prompt caching 模式描述，如 "automatic-prefix-cache"、"glm-prompt-cache"，不支持返回 "none" */
+    default String promptCacheMode() {
+        return "none";
+    }
+
     // ── 数据模型 ──
 
     /**
@@ -96,10 +111,15 @@ public interface LlmClient {
      * 模型响应
      */
     record ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
-                        int inputTokens, int outputTokens) {
+                        int inputTokens, int outputTokens, int cachedInputTokens) {
         public ChatResponse(String role, String content, List<ToolCall> toolCalls,
                             int inputTokens, int outputTokens) {
-            this(role, content, null, toolCalls, inputTokens, outputTokens);
+            this(role, content, null, toolCalls, inputTokens, outputTokens, 0);
+        }
+
+        public ChatResponse(String role, String content, String reasoningContent, List<ToolCall> toolCalls,
+                            int inputTokens, int outputTokens) {
+            this(role, content, reasoningContent, toolCalls, inputTokens, outputTokens, 0);
         }
 
         public boolean hasToolCalls() {

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.paicli.context.ContextProfile;
 import com.paicli.llm.LlmClient;
 import com.paicli.rag.CodeRetriever;
 import com.paicli.rag.SearchResultFormatter;
@@ -74,6 +75,7 @@ public class ToolRegistry {
     private WebFetcher webFetcher;
     private HtmlExtractor htmlExtractor;
     private NetworkPolicy networkPolicy;
+    private ContextProfile contextProfile = ContextProfile.from(null);
 
     public ToolRegistry() {
         this(DEFAULT_COMMAND_TIMEOUT_SECONDS, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS);
@@ -108,6 +110,16 @@ public class ToolRegistry {
      */
     public String getProjectPath() {
         return projectPath;
+    }
+
+    public void setContextProfile(ContextProfile contextProfile) {
+        if (contextProfile != null) {
+            this.contextProfile = contextProfile;
+        }
+    }
+
+    public ContextProfile getContextProfile() {
+        return contextProfile;
     }
 
     /**

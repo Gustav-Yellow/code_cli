@@ -1,5 +1,6 @@
 package com.paicli.agent;
 
+import com.paicli.context.ContextProfile;
 import com.paicli.llm.LlmClient;
 
 import java.util.ArrayDeque;
@@ -35,7 +36,6 @@ public class AgentBudget {
         HARD_ITERATION_LIMIT
     }
 
-    private static final int DEFAULT_TOKEN_BUDGET = 300_000;
     private static final int DEFAULT_STAGNATION_WINDOW = 3;
     private static final int DEFAULT_HARD_MAX_ITERATIONS = 50;
 
@@ -47,6 +47,7 @@ public class AgentBudget {
     private int iteration;
     private int totalInputTokens;
     private int totalOutputTokens;
+    private int totalCachedInputTokens;
     private boolean stagnant;
 
     public AgentBudget(int tokenBudget, int stagnationWindow, int hardMaxIterations) {
@@ -65,8 +66,14 @@ public class AgentBudget {
     }
 
     public static AgentBudget fromSystemProperties() {
+        return fromLlmClient(null);
+    }
+
+    /** 按当前 LLM 模型的 maxContextWindow 动态计算 token 预算（默认 80% × window） */
+    public static AgentBudget fromLlmClient(LlmClient llmClient) {
+        ContextProfile profile = ContextProfile.from(llmClient);
         return new AgentBudget(
-                readIntProperty("paicli.react.token.budget", DEFAULT_TOKEN_BUDGET),
+                readIntProperty("paicli.react.token.budget", profile.agentTokenBudget()),
                 readIntProperty("paicli.react.stagnation.window", DEFAULT_STAGNATION_WINDOW),
                 readIntProperty("paicli.react.hard.max.iterations", DEFAULT_HARD_MAX_ITERATIONS)
         );
@@ -78,8 +85,13 @@ public class AgentBudget {
     }
 
     public void recordTokens(int inputTokens, int outputTokens) {
+        recordTokens(inputTokens, outputTokens, 0);
+    }
+
+    public void recordTokens(int inputTokens, int outputTokens, int cachedInputTokens) {
         this.totalInputTokens += Math.max(0, inputTokens);
         this.totalOutputTokens += Math.max(0, outputTokens);
+        this.totalCachedInputTokens += Math.max(0, cachedInputTokens);
     }
 
     /**
@@ -120,6 +132,7 @@ public class AgentBudget {
     public int iteration() { return iteration; }
     public int totalInputTokens() { return totalInputTokens; }
     public int totalOutputTokens() { return totalOutputTokens; }
+    public int totalCachedInputTokens() { return totalCachedInputTokens; }
     public int tokenBudget() { return tokenBudget; }
     public int hardMaxIterations() { return hardMaxIterations; }
     public int stagnationWindow() { return stagnationWindow; }

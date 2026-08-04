@@ -38,12 +38,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * PaiCLI v9.0.0 - MCP-Advanced Agent CLI
+ * PaiCLI v10.0.0 - Browser-Capable Agent CLI
  * 支持 ReAct、Plan-and-Execute、Memory、RAG、Multi-Agent、HITL、并行工具调用、多模型切换、MCP
- * 第 10 期新增：MCP resources / prompts / @-mention / 被动通知 / 运行时取消
+ * 第 11 期新增：默认接入 chrome-devtools MCP server、HITL 按 MCP server 全放行、长上下文策略
  */
 public class Main {
-    private static final String VERSION = "9.0.0";
+    private static final String VERSION = "10.0.0";
     private static final String ENV_FILE = ".env";
     private static final String LOG_DIR_PROPERTY = "paicli.log.dir";
     private static final String LOG_LEVEL_PROPERTY = "paicli.log.level";
@@ -63,6 +63,17 @@ public class Main {
 
     /** Ctrl+O 的 ASCII 码，用于展开完整计划视图 */
     private static final int CTRL_O = 15;
+    /** 默认 MCP 配置模板：chrome-devtools（isolated 模式，首次启动时自动创建） */
+    private static final String DEFAULT_CHROME_DEVTOOLS_MCP_JSON = """
+            {
+              "mcpServers": {
+                "chrome-devtools": {
+                  "command": "npx",
+                  "args": ["-y", "chrome-devtools-mcp@latest", "--isolated=true"]
+                }
+              }
+            }
+            """;
 
     enum EscapeSequenceType {
         STANDALONE_ESC,
@@ -156,8 +167,15 @@ public class Main {
             // 初始化 MCP 子系统
             McpServerManager mcpServerManager = new McpServerManager(hitlToolRegistry, Path.of("."));
             try {
+                McpConfigBootstrapResult bootstrapResult = ensureDefaultMcpConfig(Path.of(System.getProperty("user.home")));
+                if (!bootstrapResult.message().isBlank()) {
+                    System.out.println(bootstrapResult.message());
+                }
                 mcpServerManager.loadConfiguredServers();
-                mcpServerManager.startAll();
+                if (!mcpServerManager.servers().isEmpty()) {
+                    System.out.println("🔌 启动 MCP server（" + mcpServerManager.servers().size() + " 个）...");
+                }
+                mcpServerManager.startAll(System.out);
                 Runtime.getRuntime().addShutdownHook(new Thread(mcpServerManager::close, "paicli-mcp-shutdown"));
                 System.out.println(mcpServerManager.startupSummary());
                 System.out.println();
@@ -168,6 +186,7 @@ public class Main {
 
             // 默认使用 ReAct 模式，注入 HITL 审批
             Agent reactAgent = new Agent(llmClient, sharedHistory, sharedMemory, hitlToolRegistry);
+            reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
             System.out.println("🔄 使用 ReAct 模式\n");
             // nextTaskUsePlanMode：/plan 命令设置此标记，下一条输入走 Plan 模式
             boolean nextTaskUsePlanMode = false;
@@ -1153,9 +1172,33 @@ public class Main {
         System.out.println("║   ██║     ██║  ██║██║╚██████╗███████╗██║                ║");
         System.out.println("║   ╚═╝     ╚═╝  ╚═╝╚═╝ ╚═════╝╚══════╝╚═╝                ║");
         System.out.println("║                                                          ║");
-        System.out.printf("║      MCP-Advanced Agent CLI %-28s║%n", "v" + VERSION);
+        System.out.printf("║      Browser-Capable Agent CLI %-24s║%n", "v" + VERSION);
         System.out.println("║                                                          ║");
         System.out.println("╚══════════════════════════════════════════════════════════╝");
         System.out.println();
+    }
+
+    /**
+     * 首次启动时自动创建默认 MCP 配置（包含 chrome-devtools）。
+     * 已有配置但未含 chrome-devtools 时打印提示。
+     */
+    static McpConfigBootstrapResult ensureDefaultMcpConfig(Path userHome) throws IOException {
+        Path configFile = userHome.resolve(".paicli").resolve("mcp.json");
+        if (Files.notExists(configFile)) {
+            Files.createDirectories(configFile.getParent());
+            Files.writeString(configFile, DEFAULT_CHROME_DEVTOOLS_MCP_JSON);
+            return new McpConfigBootstrapResult(true,
+                    "✅ 已创建默认 MCP 配置: " + configFile
+                            + "\n   默认启用 chrome-devtools（isolated 模式）。");
+        }
+        String content = Files.readString(configFile);
+        if (!content.contains("\"chrome-devtools\"")) {
+            return new McpConfigBootstrapResult(false,
+                    "ℹ️ 检测到 ~/.paicli/mcp.json 未配置 chrome-devtools，建议参考 README 添加浏览器 MCP server。");
+        }
+        return new McpConfigBootstrapResult(false, "");
+    }
+
+    record McpConfigBootstrapResult(boolean created, String message) {
     }
 }

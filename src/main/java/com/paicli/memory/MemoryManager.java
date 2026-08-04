@@ -1,5 +1,6 @@
 package com.paicli.memory;
 
+import com.paicli.context.ContextProfile;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmClient.Message;
 
@@ -21,30 +22,46 @@ public class MemoryManager {
     private final ContextCompressor compressor;
     private final MemoryRetriever retriever;
     private final TokenBudget tokenBudget;
+    private ContextProfile contextProfile;
 
     // 保留最近 N 轮完整消息不压缩
     private static final int RETAIN_RECENT_ROUNDS = 3;
 
     public MemoryManager(LlmClient llmClient) {
-        this(llmClient, 200000, null);
+        this(llmClient, ContextProfile.from(llmClient), null);
     }
 
     public MemoryManager(LlmClient llmClient, int contextWindow) {
-        this(llmClient, contextWindow, null);
+        this(llmClient, ContextProfile.custom(contextWindow, (int) (contextWindow * 0.45)), null);
     }
 
     public MemoryManager(LlmClient llmClient, int contextWindow, LongTermMemory longTermMemory) {
+        this(llmClient, ContextProfile.custom(contextWindow, (int) Math.max(4_000, contextWindow * 0.45)), longTermMemory);
+    }
+
+    private MemoryManager(LlmClient llmClient, ContextProfile contextProfile, LongTermMemory longTermMemory) {
+        this.contextProfile = contextProfile;
         this.longTermMemory = longTermMemory != null ? longTermMemory : new LongTermMemory();
         this.compressor = new ContextCompressor(llmClient);
         this.retriever = new MemoryRetriever(this.longTermMemory);
-        this.tokenBudget = new TokenBudget(contextWindow);
+        this.tokenBudget = new TokenBudget(contextProfile.maxContextWindow());
     }
 
     /**
-     * 更新 LLM 客户端（用于运行时模型切换）
+     * 更新 LLM 客户端（用于运行时模型切换），同步更新上下文策略。
      */
     public void setLlmClient(LlmClient llmClient) {
         this.compressor.setLlmClient(llmClient);
+        applyContextProfile(ContextProfile.from(llmClient));
+    }
+
+    private void applyContextProfile(ContextProfile contextProfile) {
+        this.contextProfile = contextProfile;
+    }
+
+    /** 获取当前上下文策略配置 */
+    public ContextProfile getContextProfile() {
+        return contextProfile;
     }
 
     /**

@@ -15,8 +15,10 @@ import com.paicli.mcp.transport.StreamableHttpTransport;
 import com.paicli.tool.ToolRegistry;
 
 import java.io.IOException;
+import java.io.PrintStream;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -42,6 +44,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * - 提供 restart / disable / enable / logs / resources / prompts 管理命令
  */
 public class McpServerManager implements AutoCloseable {
+    private static final Duration STARTUP_PROGRESS_INTERVAL = Duration.ofSeconds(5);
+
     private final ToolRegistry toolRegistry;
     private final Path projectDir;
     private final McpConfigLoader configLoader;
@@ -67,6 +71,11 @@ public class McpServerManager implements AutoCloseable {
 
     /** 并行启动所有非 disabled 的 server */
     public void startAll() {
+        startAll(null);
+    }
+
+    /** 并行启动，可选进度输出流（chrome-devtools 等首次启动较慢 server 需要进度提示） */
+    public void startAll(PrintStream progressOut) {
         List<McpServer> targets = servers.values().stream()
                 .filter(server -> !server.config().isDisabled())
                 .toList();
@@ -81,14 +90,51 @@ public class McpServerManager implements AutoCloseable {
                     t.setDaemon(true);
                     return t;
                 });
+        Thread progressPrinter = startProgressPrinter(targets, progressOut, STARTUP_PROGRESS_INTERVAL);
         try {
             List<CompletableFuture<Void>> futures = targets.stream()
                     .map(server -> CompletableFuture.runAsync(() -> start(server), executor))
                     .toList();
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         } finally {
+            if (progressPrinter != null) {
+                progressPrinter.interrupt();
+            }
             executor.shutdown();
         }
+    }
+
+    private Thread startProgressPrinter(List<McpServer> targets, PrintStream out, Duration interval) {
+        if (out == null || targets.isEmpty()) {
+            return null;
+        }
+        Map<String, Instant> startedAt = new ConcurrentHashMap<>();
+        targets.forEach(server -> startedAt.put(server.name(), Instant.now()));
+        Thread thread = new Thread(() -> {
+            try {
+                while (!Thread.currentThread().isInterrupted()) {
+                    TimeUnit.MILLISECONDS.sleep(interval.toMillis());
+                    List<McpServer> starting = targets.stream()
+                            .filter(server -> server.status() == McpServerStatus.STARTING)
+                            .sorted(Comparator.comparing(McpServer::name))
+                            .toList();
+                    if (starting.isEmpty()) {
+                        continue;
+                    }
+                    for (McpServer server : starting) {
+                        long waited = Duration.between(startedAt.get(server.name()), Instant.now()).toSeconds();
+                        out.printf("   ⏳ %-16s %-6s 启动中...（已等待 %ds）%n",
+                                server.name(), server.transportName(), waited);
+                    }
+                    out.flush();
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }, "paicli-mcp-startup-progress");
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
     }
 
     /** 重启单个 server */
@@ -210,6 +256,38 @@ public class McpServerManager implements AutoCloseable {
     /** 返回所有已缓存的 resource 候选（用于 @-mention 补全） */
     public List<McpResourceDescriptor> resourceCandidates() {
         return resourceCache.all();
+    }
+
+    /**
+     * 生成 MCP resource 索引文本（仅 URI / 描述，不含正文）。
+     * 在长上下文模式下注入到 system prompt，让 LLM 知道有哪些 resource 可用。
+     */
+    public String resourceIndexForPrompt() {
+        List<McpResourceDescriptor> resources = resourceCache.all().stream()
+                .sorted(Comparator.comparing(McpResourceDescriptor::serverName)
+                        .thenComparing(McpResourceDescriptor::uri))
+                .limit(200)
+                .toList();
+        if (resources.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder("## MCP Resources 索引（仅 URI / 描述，不含正文）\n\n");
+        sb.append("长上下文模式下可参考以下资源索引判断是否需要读取 resource；需要正文时再调用对应 MCP resource 工具或使用用户显式 @-mention。\n\n");
+        for (McpResourceDescriptor resource : resources) {
+            sb.append("- @").append(resource.serverName()).append(':').append(resource.uri());
+            String displayName = resource.displayName();
+            if (!displayName.equals(resource.uri())) {
+                sb.append(" — ").append(displayName);
+            }
+            if (resource.description() != null && !resource.description().isBlank()) {
+                sb.append("：").append(resource.description());
+            }
+            if (resource.mimeType() != null && !resource.mimeType().isBlank()) {
+                sb.append(" [").append(resource.mimeType()).append(']');
+            }
+            sb.append('\n');
+        }
+        return sb.toString().trim();
     }
 
     /** 列出指定 server 的 resources */

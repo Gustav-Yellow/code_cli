@@ -5,6 +5,8 @@ import com.paicli.memory.MemoryManager;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
 import com.paicli.tool.ToolRegistry.ToolInvocation;
+import com.paicli.context.ContextProfile;
+import com.paicli.context.TokenUsageFormatter;
 import com.paicli.runtime.CancellationContext;
 import com.paicli.util.AnsiStyle;
 import com.paicli.util.TerminalMarkdownRenderer;
@@ -19,6 +21,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 public class Agent {
 
@@ -27,6 +30,7 @@ public class Agent {
     private final ToolRegistry toolRegistry;
     private final List<LlmClient.Message> conversationHistory;
     private final MemoryManager memoryManager;
+    private Supplier<String> externalContextSupplier = () -> "";
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
     // 系统提示词，给 Agent 限定身份
@@ -91,6 +95,7 @@ public class Agent {
         this.toolRegistry = toolRegistry;
         this.conversationHistory = sharedHistory;
         this.memoryManager = sharedMemory;
+        this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
 
         // 保证 index 0 是 system prompt（供 Plan 后续追加、压缩保留 index 0）
         if (conversationHistory.isEmpty()) {
@@ -104,6 +109,11 @@ public class Agent {
     public void setLlmClient(LlmClient llmClient) {
         this.llmClient = llmClient;
         this.memoryManager.setLlmClient(llmClient);
+        this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
+    }
+
+    public void setExternalContextSupplier(Supplier<String> externalContextSupplier) {
+        this.externalContextSupplier = externalContextSupplier == null ? () -> "" : externalContextSupplier;
     }
 
     /**
@@ -112,7 +122,8 @@ public class Agent {
     public String run(String userInput) {
         log.info("ReAct run started: inputLength={}", userInput == null ? 0 : userInput.length());
         // 先检索相关长期记忆并注入 system prompt（检索在写入历史之前，避免自匹配）
-        String memoryContext = memoryManager.buildContextForQuery(userInput, 500);
+        ContextProfile contextProfile = memoryManager.getContextProfile();
+        String memoryContext = memoryManager.buildContextForQuery(userInput, contextProfile.memoryContextTokens());
         updateSystemPromptWithMemory(memoryContext);
 
         // 添加用户输入到历史（保持原文，不污染 user message）
@@ -126,7 +137,7 @@ public class Agent {
         StreamRenderer streamRenderer = new StreamRenderer();
 
         long startNanos = System.nanoTime();
-        AgentBudget budget = AgentBudget.fromSystemProperties();
+        AgentBudget budget = AgentBudget.fromLlmClient(llmClient);
 
         // 主退出条件 = LLM 自己决定（不再调用工具就返回）；
         // budget 仅在 token 用尽 / 检测到死循环 / 超出硬轮数时兜底。
@@ -136,7 +147,7 @@ public class Agent {
             }
             AgentBudget.ExitReason exitReason = budget.check();
             if (exitReason != AgentBudget.ExitReason.WITHIN_BUDGET) {
-                String statsLine = formatTokenStats(budget.totalInputTokens(), budget.totalOutputTokens(), startNanos);
+                String statsLine = formatTokenStats(budget, startNanos);
                 String description = budget.describeExit(exitReason);
                 log.warn("ReAct run exhausted budget: reason={}, iteration={}, tokens={}/{}",
                         exitReason, budget.iteration(),
@@ -157,7 +168,7 @@ public class Agent {
                         streamRenderer
                 );
 
-                budget.recordTokens(response.inputTokens(), response.outputTokens());
+                budget.recordTokens(response.inputTokens(), response.outputTokens(), response.cachedInputTokens());
 
                 // 如果有工具调用
                 if (response.hasToolCalls()) {
@@ -202,7 +213,7 @@ public class Agent {
                         streamRenderer.finish();
                     }
 
-                    String statsLine = formatTokenStats(budget.totalInputTokens(), budget.totalOutputTokens(), startNanos);
+                    String statsLine = formatTokenStats(budget, startNanos);
 
                     log.info("ReAct run finished: inputTokens={}, outputTokens={}, reasoningChars={}, answerChars={}",
                             budget.totalInputTokens(),
@@ -245,12 +256,31 @@ public class Agent {
      * 将从长期记忆检索到的 MemoryEntry 上下文注入到 system prompt 中（替换 conversationHistory[0]）
      */
     private void updateSystemPromptWithMemory(String memoryContext) {
-        if (memoryContext == null || memoryContext.isEmpty()) {
-            // 恢复原始 system prompt
+        String externalContext = buildExternalContext();
+        if ((memoryContext == null || memoryContext.isEmpty()) && externalContext.isEmpty()) {
             conversationHistory.set(0, LlmClient.Message.system(SYSTEM_PROMPT));
         } else {
-            String enrichedPrompt = SYSTEM_PROMPT + "\n" + memoryContext;
-            conversationHistory.set(0, LlmClient.Message.system(enrichedPrompt));
+            StringBuilder enrichedPrompt = new StringBuilder(SYSTEM_PROMPT);
+            if (memoryContext != null && !memoryContext.isEmpty()) {
+                enrichedPrompt.append("\n").append(memoryContext);
+            }
+            if (!externalContext.isEmpty()) {
+                enrichedPrompt.append("\n").append(externalContext);
+            }
+            conversationHistory.set(0, LlmClient.Message.system(enrichedPrompt.toString()));
+        }
+    }
+
+    private String buildExternalContext() {
+        if (!memoryManager.getContextProfile().mcpResourceIndexEnabled()) {
+            return "";
+        }
+        try {
+            String context = externalContextSupplier.get();
+            return context == null ? "" : context.trim();
+        } catch (Exception e) {
+            log.warn("Failed to build external context", e);
+            return "";
         }
     }
 
@@ -300,6 +330,13 @@ public class Agent {
         return toolRegistry;
     }
 
+    private String formatTokenStats(AgentBudget budget, long startNanos) {
+        return TokenUsageFormatter.format(llmClient,
+                budget.totalInputTokens(), budget.totalOutputTokens(),
+                budget.totalCachedInputTokens(), startNanos);
+    }
+
+    /** @deprecated 使用 formatTokenStats(AgentBudget, long) 替代 */
     private static String formatTokenStats(int inputTokens, int outputTokens, long startNanos) {
         double elapsedSeconds = (System.nanoTime() - startNanos) / 1_000_000_000.0;
         return AnsiStyle.subtle(String.format(

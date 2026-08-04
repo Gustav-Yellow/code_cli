@@ -33,4 +33,14 @@ public interface HitlHandler {
      * @param enabled true 表示启用，false 表示关闭
      */
     void setEnabled(boolean enabled);
+
+    /** 该工具是否已在本次会话中被全放行（工具维度） */
+    default boolean isApprovedAllByTool(String toolName) {
+        return false;
+    }
+
+    /** 该 MCP server 是否已在本次会话中被全放行（server 维度） */
+    default boolean isApprovedAllByServer(String serverName) {
+        return false;
+    }
 }
