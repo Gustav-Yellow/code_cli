@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.GLMClient;
 import com.paicli.memory.MemoryManager;
+import com.paicli.runtime.CancellationContext;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.util.AnsiStyle;
 import org.slf4j.Logger;
@@ -173,6 +174,9 @@ public class AgentOrchestrator {
         int batchIndex = 0;
 
         while (true) {
+            if (CancellationContext.isCancelled()) {
+                return "⏹️ Multi-Agent 任务已取消";
+            }
             List<ExecutionStep> executable = getExecutableSteps(steps);
             if (executable.isEmpty()) {
                 break;

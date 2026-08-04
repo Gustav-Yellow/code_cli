@@ -158,5 +158,11 @@ public class AuditLog {
             return new AuditEntry(Instant.now().toString(), tool, truncate(args),
                     OUTCOME_ERROR, reason, APPROVER_NONE, durationMs);
         }
+
+        /** @-mention 触发的 resource 读取审计记录（approver=none，由系统自动触发） */
+        public static AuditEntry allowByMention(String tool, String args, long durationMs) {
+            return new AuditEntry(Instant.now().toString(), tool, truncate(args),
+                    OUTCOME_ALLOW, null, "mention", durationMs);
+        }
     }
 }

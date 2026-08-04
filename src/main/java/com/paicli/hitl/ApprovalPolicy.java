@@ -23,16 +23,20 @@ public class ApprovalPolicy {
     }
 
     /**
-     * 判断该工具调用是否需要人工确认
+     * 判断该工具调用是否需要人工确认。
+     * 内置危险工具 + 所有 mcp__ 前缀的 MCP 工具均需审批。
      */
     public static boolean requiresApproval(String toolName) {
-        return DANGEROUS_TOOLS.contains(toolName);
+        return DANGEROUS_TOOLS.contains(toolName) || isMcpTool(toolName);
     }
 
     /**
      * 获取危险等级描述
      */
     public static String getDangerLevel(String toolName) {
+        if (isMcpTool(toolName)) {
+            return "🟡 MCP 外部工具";
+        }
         return switch (toolName) {
             case "execute_command" -> "🔴 高危";
             case "write_file" -> "🟡 中危";
@@ -45,6 +49,9 @@ public class ApprovalPolicy {
      * 获取危险操作的风险说明
      */
     public static String getRiskDescription(String toolName) {
+        if (isMcpTool(toolName)) {
+            return "MCP 外部工具调用，来自第三方 MCP server，操作范围不可提前预知";
+        }
         return switch (toolName) {
             case "execute_command" -> "将在系统上执行 Shell 命令，可能修改文件、安装软件或影响系统状态";
             case "write_file" -> "将写入或覆盖文件内容，原有内容将丢失";
@@ -54,9 +61,14 @@ public class ApprovalPolicy {
     }
 
     /**
-     * 获取所有需要审批的工具名集合（用于测试和展示）
+     * 获取所有需要审批的内置工具名集合（用于测试和展示）。
+     * 注意：MCP 工具（mcp__ 前缀）不在这个集合内，但 requiresApproval 也会对其返回 true。
      */
     public static Set<String> getDangerousTools() {
         return DANGEROUS_TOOLS;
+    }
+
+    private static boolean isMcpTool(String toolName) {
+        return toolName != null && toolName.startsWith("mcp__");
     }
 }

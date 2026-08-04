@@ -6,6 +6,7 @@ import com.paicli.llm.LlmClient;
 import com.paicli.llm.GLMClient;
 import com.paicli.memory.MemoryManager;
 import com.paicli.plan.*;
+import com.paicli.runtime.CancellationContext;
 import com.paicli.util.AnsiStyle;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
@@ -347,6 +348,9 @@ public class PlanExecuteAgent {
 
         // 每次都从无依赖或者前置依赖已经完成的节点开始执行任务。
         while (true) {
+            if (CancellationContext.isCancelled()) {
+                return "⏹️ 计划执行已取消";
+            }
             List<Task> executableTasks = getExecutableTasksInOrder(plan);
             if (executableTasks.isEmpty()) {
                 break;

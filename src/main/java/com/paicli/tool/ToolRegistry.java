@@ -8,6 +8,7 @@ import com.paicli.llm.LlmClient;
 import com.paicli.rag.CodeRetriever;
 import com.paicli.rag.SearchResultFormatter;
 import com.paicli.rag.VectorStore;
+import com.paicli.mcp.protocol.McpToolDescriptor;
 import com.paicli.policy.AuditLog;
 import com.paicli.policy.CommandGuard;
 import com.paicli.policy.PathGuard;
@@ -28,11 +29,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.*;
+import java.util.function.Function;
 
 /**
  * 工具注册表 - 管理所有可用工具
@@ -58,8 +62,9 @@ public class ToolRegistry {
     // write_file 单次写入字节数上限。LLM 想塞超大内容时通常是误生成（重复粘贴 / hallucinate 大段日志），
     // 5MB 对教学项目完全够用，超过即拒，避免磁盘灌满与误覆盖。
     private static final int MAX_WRITE_FILE_BYTES = 5 * 1024 * 1024;
-    // 需要审计的工具（与 ApprovalPolicy 的 DANGEROUS_TOOLS 保持一致）。
+    // 需要审计的内置工具（与 ApprovalPolicy 的 DANGEROUS_TOOLS 保持一致）；MCP 工具按前缀动态纳入审计。
     private static final Set<String> AUDIT_TOOLS = Set.of("write_file", "execute_command", "create_project");
+    private final Map<String, McpRegisteredTool> mcpTools = new LinkedHashMap<>();
     private final long commandTimeoutSeconds;
     private final long toolBatchTimeoutSeconds;
     private String projectPath = System.getProperty("user.dir");
@@ -553,13 +558,33 @@ public class ToolRegistry {
      * </ul>
      */
     public String executeTool(String name, String argumentsJson) {
+        // 步骤0：MCP 工具走独立执行路径（不经过 Map<String,String> 解析）
+        McpRegisteredTool mcpTool = mcpTools.get(name);
+        if (mcpTool != null) {
+            boolean shouldAudit = shouldAudit(name);
+            long start = System.nanoTime();
+            try {
+                String result = mcpTool.invoker().apply(argumentsJson);
+                if (shouldAudit) {
+                    auditLog.record(AuditLog.AuditEntry.allow(name, argumentsJson, elapsedMillis(start)));
+                }
+                return result;
+            } catch (Exception e) {
+                if (shouldAudit) {
+                    auditLog.record(AuditLog.AuditEntry.error(
+                            name, argumentsJson, e.getMessage(), elapsedMillis(start)));
+                }
+                return "工具执行失败: " + e.getMessage();
+            }
+        }
+
         // 步骤1：查找工具
         Tool tool = tools.get(name);
         if (tool == null) {
             return "未知工具: " + name;
         }
 
-        boolean shouldAudit = AUDIT_TOOLS.contains(name);
+        boolean shouldAudit = shouldAudit(name);
         long start = System.nanoTime();
 
         try {
@@ -672,6 +697,72 @@ public class ToolRegistry {
         return tools.containsKey(name);
     }
 
+    /**
+     * 注册一个 MCP 工具到 ToolRegistry。
+     *
+     * @param descriptor 工具描述（含 namespacedName 如 mcp__filesystem__read_file）
+     * @param invoker    工具执行器：输入 JSON 参数字符串，输出给 LLM 看的字符串结果。
+     */
+    public void registerMcpTool(McpToolDescriptor descriptor, Function<String, String> invoker) {
+        Objects.requireNonNull(descriptor, "descriptor");
+        Objects.requireNonNull(invoker, "invoker");
+        String toolName = descriptor.namespacedName();
+        McpRegisteredTool registered = new McpRegisteredTool(descriptor, invoker);
+        mcpTools.put(toolName, registered);
+        tools.put(toolName, new Tool(
+                toolName,
+                mcpDescription(descriptor),
+                descriptor.inputSchema(),
+                args -> "MCP 工具不应通过 Map<String,String> 入口执行"
+        ));
+    }
+
+    /** 注销一个 MCP 工具 */
+    public void unregisterMcpTool(String toolName) {
+        if (toolName == null || toolName.isBlank()) {
+            return;
+        }
+        mcpTools.remove(toolName);
+        tools.remove(toolName);
+    }
+
+    /**
+     * 全量替换某个 MCP server 的工具列表。
+     *
+     * 先注销该 server 下所有旧工具，再注册新工具。
+     * 用于被动通知 tools/list_changed 处理：先拉新工具列表，再调用本方法一次完成替换。
+     *
+     * @param serverName      MCP server 名称
+     * @param descriptors     新的工具描述符列表
+     * @param invokerFactory  按 descriptor 生成执行器的工厂函数
+     */
+    public void replaceMcpToolsForServer(String serverName, List<McpToolDescriptor> descriptors,
+                                         Function<McpToolDescriptor, Function<String, String>> invokerFactory) {
+        // 注销该 server 下的旧工具
+        var toRemove = mcpTools.values().stream()
+                .filter(mcp -> mcp.descriptor().serverName().equals(serverName))
+                .map(mcp -> mcp.descriptor().namespacedName())
+                .toList();
+        for (String name : toRemove) {
+            unregisterMcpTool(name);
+        }
+        // 注册新工具
+        for (McpToolDescriptor descriptor : descriptors) {
+            registerMcpTool(descriptor, invokerFactory.apply(descriptor));
+        }
+    }
+
+    private static boolean shouldAudit(String name) {
+        return AUDIT_TOOLS.contains(name) || (name != null && name.startsWith("mcp__"));
+    }
+
+    private static String mcpDescription(McpToolDescriptor descriptor) {
+        String base = descriptor.description() == null || descriptor.description().isBlank()
+                ? "MCP server 提供的外部工具"
+                : descriptor.description();
+        return base + " (MCP server: " + descriptor.serverName() + ", tool: " + descriptor.name() + ")";
+    }
+
     private String executeCommand(String command) {
         String normalized = command == null ? "" : command.trim();
         if (normalized.isEmpty()) {
@@ -765,6 +856,8 @@ public class ToolRegistry {
      * @param executor 工具执行器
      */
     public record Tool(String name, String description, JsonNode parameters, ToolExecutor executor) {}
+
+    private record McpRegisteredTool(McpToolDescriptor descriptor, Function<String, String> invoker) {}
 
     public interface ToolExecutor {
         String execute(Map<String, String> args);

@@ -5,6 +5,7 @@ import com.paicli.memory.MemoryManager;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.tool.ToolRegistry.ToolExecutionResult;
 import com.paicli.tool.ToolRegistry.ToolInvocation;
+import com.paicli.runtime.CancellationContext;
 import com.paicli.util.AnsiStyle;
 import com.paicli.util.TerminalMarkdownRenderer;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -130,6 +131,9 @@ public class Agent {
         // 主退出条件 = LLM 自己决定（不再调用工具就返回）；
         // budget 仅在 token 用尽 / 检测到死循环 / 超出硬轮数时兜底。
         while (true) {
+            if (CancellationContext.isCancelled()) {
+                return "⏹️ 任务已取消";
+            }
             AgentBudget.ExitReason exitReason = budget.check();
             if (exitReason != AgentBudget.ExitReason.WITHIN_BUDGET) {
                 String statsLine = formatTokenStats(budget.totalInputTokens(), budget.totalOutputTokens(), startNanos);
