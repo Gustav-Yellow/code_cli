@@ -1,6 +1,6 @@
 # Chapter 9 — MCP 协议集成开发
 
-> PaiCLI 第 9–10 期：接入 MCP（Model Context Protocol）生态，让 Agent 可以调用外部 MCP server 提供的工具和资源。
+> PaiCLI 第 9–11 期：接入 MCP（Model Context Protocol）生态，让 Agent 调用外部 MCP server 工具和资源，默认集成 Chrome DevTools 浏览器操控，并建立长上下文策略体系。
 
 ---
 
@@ -20,8 +20,14 @@
    - [4.3 @-mention 系统](#43--mention-系统)
    - [4.4 被动通知处理](#44-被动通知处理)
    - [4.5 运行时取消](#45-运行时取消)
-5. [端到端示例](#5-端到端示例)
-6. [关键设计要点](#6-关键设计要点)
+5. [第三阶段：Chrome DevTools MCP + 长上下文](#5-第三阶段chrome-devtools-mcp--长上下文)
+   - [5.1 LLM 能力声明](#51-llm-能力声明)
+   - [5.2 上下文策略（ContextProfile）](#52-上下文策略contextprofile)
+   - [5.3 Chrome DevTools 自动接入](#53-chrome-devtools-自动接入)
+   - [5.4 HITL server 维度全放行](#54-hitl-server-维度全放行)
+   - [5.5 Image fallback 引导](#55-image-fallback-引导)
+6. [端到端示例](#6-端到端示例)
+7. [关键设计要点](#7-关键设计要点)
 
 ---
 
@@ -635,7 +641,223 @@ while (true) {
 
 ---
 
-## 5. 端到端示例
+## 5. 第三阶段：Chrome DevTools MCP + 长上下文
+
+> 对应 ROADMAP 第 11 期，基于模板项目 commit `08be113`。
+
+### 5.1 LLM 能力声明
+
+为了让上下文策略能按模型自适应，`LlmClient` 接口新增三个默认方法：
+
+```java
+public interface LlmClient {
+    // 模型最大上下文窗口（token 数），默认 128k
+    default int maxContextWindow() { return 128_000; }
+    // 是否支持 prompt caching，默认 false
+    default boolean supportsPromptCaching() { return false; }
+    // prompt cache 模式描述，默认 "none"
+    default String promptCacheMode() { return "none"; }
+}
+```
+
+各模型实现覆写：
+
+| 模型 | maxContextWindow | supportsPromptCaching | promptCacheMode |
+|---|---|---|---|
+| GLM-5.2 | 200,000 | true | `glm-prompt-cache` |
+| DeepSeek V4 | 1,000,000 | true | `automatic-prefix-cache` |
+
+**ChatResponse 扩展**：新增 `cachedInputTokens` 字段，保留向后兼容构造器。
+
+**cached token 解析**（`AbstractOpenAiCompatibleClient.parseCachedInputTokens()`）：
+
+不同 provider 使用不同的字段名报告 prompt cache 命中 token，解析逻辑逐字段尝试：
+
+```java
+cached = usage.path("cached_tokens").asInt(fallback);
+cached = usage.path("prompt_cache_hit_tokens").asInt(cached);
+cached = usage.path("input_cache_hit_tokens").asInt(cached);
+// 也检查嵌套结构
+cached = usage.path("prompt_tokens_details").path("cached_tokens").asInt(cached);
+cached = usage.path("input_tokens_details").path("cached_tokens").asInt(cached);
+```
+
+### 5.2 上下文策略（ContextProfile）
+
+**设计原则**：没有"长 / 短 / 平衡"模式分档。所有参数都是 `maxContextWindow` 的简单函数，全模型走同一套行为。
+
+```java
+public record ContextProfile(
+    int maxContextWindow,           // 模型最大上下文窗口
+    int agentTokenBudget,           // Agent 单次 run 预算 = window × 0.8
+    double compressionTriggerRatio, // 压缩触发阈值 = 0.90（90%）
+    int shortTermMemoryBudget,      // 短期记忆预算 = window × 0.45
+    int memoryContextTokens,        // 注入到 system prompt 的相关记忆上限 = window/200（封顶 5000）
+    boolean mcpResourceIndexEnabled, // window ≥ 32k 时启用 MCP resource 索引注入
+    boolean promptCachingSupported,
+    String promptCacheMode
+)
+```
+
+**关键派生规则**：
+- GLM（200k window）→ Agent 预算 160k、短期记忆 90k、压缩阈值 180k
+- DeepSeek（1M window）→ Agent 预算 800k、短期记忆 450k、压缩阈值 900k
+
+**AgentBudget 动态化**：
+
+```java
+// 从写死 300k → 按模型动态计算
+public static AgentBudget fromLlmClient(LlmClient llmClient) {
+    ContextProfile profile = ContextProfile.from(llmClient);
+    return new AgentBudget(
+        readIntProperty("paicli.react.token.budget", profile.agentTokenBudget()),
+        ...
+    );
+}
+```
+
+运行时模型切换（`/model deepseek`）会自动重算预算。
+
+**Token 用量展示**（`TokenUsageFormatter`）：
+
+```
+📊 Token: 已用 45200 / 800000 (window 1000000, cached: 38000, 估算 ¥0.0810) | 输入 42000 / 输出 3200 | ⏱ 2.3s
+```
+
+按 provider 差异化定价：
+| Provider | Input（uncached） | Input（cached） | Output |
+|---|---|---|---|
+| deepseek | ¥2.0/M | ¥0.5/M | ¥8.0/M |
+| glm | ¥5.0/M | ¥1.0/M | ¥15.0/M |
+
+**MCP resource 索引注入**：
+
+长上下文模式（window ≥ 32k）下，每轮 LLM 请求前通过 `Agent.externalContextSupplier` 将 MCP resource 索引注入到 system prompt：
+
+```java
+// Main.java
+reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
+
+// Agent.java — updateSystemPromptWithMemory()
+String externalContext = buildExternalContext();  // → 调 supplier.get()
+// 拼接到 system prompt: SYSTEM_PROMPT + memoryContext + externalContext
+```
+
+resource 索引格式（仅 URI / 描述，不含正文，上限 200 条）：
+```
+## MCP Resources 索引（仅 URI / 描述，不含正文）
+- @filesystem:file:///pom.xml — pom.xml：Maven 项目配置 [text/xml]
+- @chrome-devtools:console://messages — 浏览器控制台消息 [text/plain]
+```
+
+### 5.3 Chrome DevTools 自动接入
+
+**首次启动自动创建配置**：
+
+```java
+// Main.ensureDefaultMcpConfig()
+static final String DEFAULT_CHROME_DEVTOOLS_MCP_JSON = """
+    {
+      "mcpServers": {
+        "chrome-devtools": {
+          "command": "npx",
+          "args": ["-y", "chrome-devtools-mcp@latest", "--isolated=true"]
+        }
+      }
+    }
+    """;
+```
+
+- `~/.paicli/mcp.json` 不存在 → 自动创建（含 chrome-devtools 默认配置）
+- 已存在但未含 `chrome-devtools` → 打印温馨提示
+- 已含 → 静默跳过
+
+**Initialize 超时提升**：30s → 60s（chrome-devtools 首次需 `npx` 拉包 + Chrome 冷启 ≈ 20s+），可通过系统属性或环境变量覆盖：
+
+```bash
+-Dpaicli.mcp.initialize.timeout.seconds=90
+# 或
+export PAICLI_MCP_INITIALIZE_TIMEOUT_SECONDS=90
+```
+
+**启动进度提示**：
+
+`startAll(PrintStream out)` 在启动期间另起 daemon 线程，每 5 秒输出仍在 STARTING 状态的 server 及其已等待时长：
+
+```
+🔌 启动 MCP server（2 个）...
+   ⏳ chrome-devtools  stdio  启动中...（已等待 10s）
+   ⏳ chrome-devtools  stdio  启动中...（已等待 15s）
+   ✓ chrome-devtools  stdio   28 工具
+   ✓ filesystem       stdio   14 工具
+```
+
+### 5.4 HITL server 维度全放行
+
+Chrome DevTools 有 28 个工具，每个都弹 HITL 审批框会导致体验极差。引入 **server 维度全放行**：
+
+**二级菜单**：用户按 `a` 后弹出范围选择：
+
+```
+  全部放行范围：
+  [tool / Enter] 仅本工具 mcp__chrome-devtools__navigate_page
+  [server]       整个 MCP server chrome-devtools（连续浏览器操作推荐）
+>
+```
+
+- 选 `server`（或 `s`）→ 该 server 下所有后续工具调用自动通过
+- 选 `tool`（或 Enter）→ 仅该工具后续自动通过（原行为）
+
+**实现链路**：
+
+```
+HitlToolRegistry.executeTool()
+  → hitlHandler.isApprovedAllByServer(mcpServer)  // 新增：server 维度检查
+  → hitlHandler.isApprovedAllByTool(toolName)     // 已有：工具维度检查
+  → 命中任一 → 跳过审批直接执行
+
+TerminalHitlHandler.promptApproveAllScope()
+  → MCP 工具 → 显示二级菜单
+  → 非 MCP 工具 → 保持原行为（仅工具维度）
+```
+
+**数据模型变更**：
+- `ApprovalResult.Decision.APPROVED_ALL_BY_SERVER` 新枚举值
+- `HitlHandler` 接口新增 `isApprovedAllByTool()` / `isApprovedAllByServer()` 默认方法
+- `ApprovalPolicy.mcpServerName(toolName)` 从 `mcp__{s}__{tool}` 提取 server 名
+- `TerminalHitlHandler` 用两个 `ConcurrentHashMap.newKeySet()` 分别追踪
+
+### 5.5 Image fallback 引导
+
+Chrome DevTools 的 `take_screenshot` 返回 `type: "image"` 的 content。`McpCallToolResult.formatForLlm()` 对 image 类型返回引导文案而非通用 fallback：
+
+```java
+if ("image".equals(type)) {
+    return "[此工具返回了 image。如果用户没有明确要求截图，请优先调用 "
+        + "take_snapshot 获取 DOM 文本快照；截图内容当前不会作为多模态输入交给模型。]";
+}
+```
+
+这引导 LLM 优先使用 DOM 文本快照（`take_snapshot`），而非无意义的截图 base64 数据。
+
+**Agent 系统提示词增强**：新增 chrome-devtools 专用的工具选择决策表：
+
+```
+工具选择 - 网页内容获取：
+- 静态页面（博客、文档、GitHub）→ web_fetch
+- SPA/React/客户端渲染 → 浏览器 MCP（navigate_page + take_snapshot）
+- 防爬墙/需登录/需表单交互 → 浏览器 MCP
+- 微信公众号、知乎、推特 → 浏览器 MCP
+
+工具选择 - 浏览器操作：
+- 优先 take_snapshot（结构化 DOM 文本，LLM 能直接理解）
+- 不要默认 take_screenshot，除非用户明确要看截图
+- 表单填写优先 fill_form；异步加载用 wait_for
+```
+
+---
+
+## 6. 端到端示例
 
 ### 配置 mcp.json
 
@@ -711,16 +933,56 @@ while (true) {
 
 ---
 
-## 6. 关键设计要点
+### 浏览器操控示例
 
-### 6.1 命名空间隔离
+```
+👤 你: 帮我查一下微信公众号上这篇关于 Java 21 的文章
+     https://mp.weixin.qq.com/s/RB7kF_BbsJZ5_Hmu9PxWdg
+
+🔄 Agent：
+  1. web_fetch → 返回空正文（SPA 防爬墙）
+  2. 根据系统提示词的决策表 → 自动 fallback 到浏览器 MCP
+  3. mcp__chrome-devtools__navigate_page({"url": "..."})
+  4. mcp__chrome-devtools__wait_for({"text": "Java 21"})
+  5. mcp__chrome-devtools__take_snapshot() → 获取 DOM 文本快照
+  6. LLM 基于快照内容回答用户
+
+👤 你: /hitl on
+👤 你: 用浏览器搜索"Spring Boot 3.3 新特性"的前 3 篇博客
+
+🔄 Agent：
+  [HITL 审批框弹出 — mcp__chrome-devtools__navigate_page]
+  👤 按 a → 选 server → 整个 chrome-devtools server 全放行
+  后续所有浏览器操作自动通过
+```
+
+### 上下文切换示例
+
+```
+👤 你: /model
+🤖 当前模型: glm-5.2 (glm)
+   可用模型：glm, deepseek
+
+👤 你: /model deepseek
+✅ 已切换到: deepseek-v4-flash (deepseek)
+   上下文策略: window: 1000000 | 压缩阈值: 90% (900000 tokens) 
+             | 短期记忆预算: 450000 | MCP resource 索引: on 
+             | prompt cache: automatic-prefix-cache
+   对话上下文已保留，使用 /clear 可清空
+```
+
+---
+
+## 7. 关键设计要点
+
+### 7.1 命名空间隔离
 
 MCP 工具以 `mcp__{server}__{tool}` 格式注册，确保：
 - 不同 server 的同名工具不冲突（如多个 server 都有 `read_file`）
 - MCP 工具名不会与内置工具名冲突
 - LLM 看到前缀即可区分 MCP 工具和内置工具
 
-### 6.2 错误隔离
+### 7.2 错误隔离
 
 MCP 是"外部依赖"，必须做防御性设计：
 - **单 server 失败不阻塞其他 server**：`startAll()` 用 `CompletableFuture.allOf().join()`，单个异常被 catch 后在 `start()` 内部转为 ERROR 状态
@@ -728,22 +990,23 @@ MCP 是"外部依赖"，必须做防御性设计：
 - **不支持的 MCP 方法优雅降级**：`listResources()` / `listPrompts()` 对 -32601（MethodNotFound）返回空列表
 - **关闭时 best-effort**：`close()` 不因 server 已死/网络不通而卡住
 
-### 6.3 安全模型
+### 7.3 安全模型
 
 MCP 工具默认走 HITL 审批链：
 - `ApprovalPolicy.requiresApproval(name)` 对 `mcp__` 前缀返回 `true`
 - 危险等级标记为"🟡 MCP 外部工具"
 - 审计日志中 tool 字段带 `mcp__` 前缀，可区分来源
+- **Server 维度全放行**：MCP 工具的 `a` 改为二级菜单（tool vs server），连续浏览器操作只需确认一次
 
 `HitlToolRegistry` 继承 `ToolRegistry` 覆写 `executeTool()`，MCP 工具自然也走 HITL 拦截，零适配成本。
 
-### 6.4 Schema 清洗的必要性
+### 7.4 Schema 清洗的必要性
 
 第三方 MCP server 的 inputSchema 自由度很高，可能包含 `$ref`、`anyOf`、`oneOf` 等 JSON Schema 高级特性。部分 LLM 的 function calling API 只接受简化的 JSON Schema（type + properties + required + description），遇到 `$ref` 等会返回 400。
 
 `McpSchemaSanitizer` 做最小清洗：去掉不兼容关键字、展平 union 类型到 description、保证 type 和 properties 存在。这样最大化了 MCP 工具的 LLM 兼容性。
 
-### 6.5 通知异步派发的必要性
+### 7.5 通知异步派发的必要性
 
 MCP server 可以在任何时刻推送通知。如果通知处理器在 transport stdout reader 线程里同步执行，而 handler 内部又要发 JSON-RPC 请求并等响应（如 tools/list_changed → 重拉 tools/list），就会形成**自我死锁**：
 
@@ -755,6 +1018,30 @@ stdout reader 线程 → 收到通知 → handler.apply() → 发 tools/list →
 
 `NotificationRouter` 用独立 daemon executor 异步派发，从根上避免了这个问题。
 
+### 7.6 上下文策略无模式分档
+
+传统实现常分为"短/平衡/长"三档模式，但实际使用中用户几乎不会手动切换。本实现采用**全模型统一函数**：
+
+- 所有参数（预算、压缩阈值、记忆上限、resource 索引）都是 `maxContextWindow` 的数学函数
+- GLM 200k → 预算 160k，DeepSeek 1M → 预算 800k
+- 切换模型时自动重算，无需用户感知
+- 保留 `paicli.react.token.budget` 系统属性手动覆盖能力
+
+### 7.7 Chrome DevTools 首次启动零配置
+
+- 首次运行时 `~/.paicli/mcp.json` 不存在 → 自动创建含 chrome-devtools（isolated 模式）
+- Initialize 超时 60s（npx 拉包 + Chrome 冷启需要时间），可通过系统属性覆盖
+- 启动期间每 5 秒打印进度（显示"已等待 Ns"），避免用户焦虑
+- 已存在配置但未含 chrome-devtools 时打印提示，不强制覆盖用户配置
+
+### 7.8 Image → DOM 引导
+
+Chrome DevTools 的 `take_screenshot` 返回 image content。当前 LLM 无法直接理解图片，因此 `McpCallToolResult.formatForLlm()` 对 image 类型返回**引导文案**而非无意义的数据引用：
+
+> "如果用户没有明确要求截图，请优先调用 take_snapshot 获取 DOM 文本快照"
+
+Agent 系统提示词中也有对应的工具选择优先级规则，确保 LLM 默认走 DOM 文本路径而非截图路径。
+
 ---
 
-*第 9–10 期 MCP 集成开发完成。代码实现基于模板项目 commit `89296e9` 和 `5de88fb`，适配当前 PaiCLI 项目的上下文管理、ToolRegistry 设计和 CLI 架构。*
+*第 9–11 期 MCP 集成开发完成。代码实现基于模板项目 commit `89296e9`、`5de88fb` 和 `08be113`，适配当前 PaiCLI 项目的上下文管理、ToolRegistry 设计和 CLI 架构。*

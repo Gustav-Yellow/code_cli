@@ -15,7 +15,7 @@
 - **核心依赖**：OkHttp 4.12（HTTP）、Jackson 2.16（JSON）、Logback 1.5（日志）、JLine 3.26（终端）、jieba-analysis 1.0.2（中文分词）、sqlite-jdbc 3.49（SQLite）、javaparser-core 3.28（AST 解析）
 - **默认 LLM**：智谱 GLM-5.2（`https://open.bigmodel.cn/api/coding/paas/v4/chat/completions`），OpenAI 兼容协议
 - **入口类**：`com.paicli.cli.Main`
-- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7 期（异步并行工具执行）已完成并文档化（`docs/Chapter7-Async_Parallel实现.md`）；第 7.1 期（LLMClient 多模型适配）已完成并文档化（`docs/Chapter7.1-LLMClient开发.md`）；第 8 期（Web Search Tool 联网工具）已完成并文档化（`docs/Chapter8-Web_Search_Tool开发.md`）；第 9–21 期见 ROADMAP.md
+- **当前进度**：第 1 期（ReAct + Tool Call）、第 2 期（Plan-and-Execute）、第 3 期（Memory 系统）、第 4 期（RAG 检索）已完成并文档化（`docs/chapter1-*.md` / `docs/chapter2-*.md` / `docs/chapter3-*.md` / `docs/chapter4-*.md`）；第 4.1 期（流式输出 + 日志 + CLI 修复）已完成（`docs/chapter4.1-*.md`）；第 5 期（Multi-Agent 协作）已完成并文档化（`docs/chapter5-*.md`）；第 6 期（HITL 审批）已完成并文档化（`docs/Chapter6-HITL实现.md`）；第 7 期（异步并行工具执行）已完成并文档化（`docs/Chapter7-Async_Parallel实现.md`）；第 7.1 期（LLMClient 多模型适配）已完成并文档化（`docs/Chapter7.1-LLMClient开发.md`）；第 8 期（Web Search Tool 联网工具）已完成并文档化（`docs/Chapter8-Web_Search_Tool开发.md`）；第 9 期（MCP 协议核心）已完成并文档化（`docs/Chapter9-MCP开发.md`）；第 10 期（MCP 高级能力 — resources / @-mention / 通知 / 取消）已完成；第 11 期（Chrome DevTools MCP + 长上下文策略）已完成；第 12–21 期见 ROADMAP.md
 
 设计哲学：**手写优先，框架在后**。21 期主线全部手写完成后，才会开启 Pro 分支用 Spring AI / LangGraph4J 重构做对照实现。日常开发不要提前引入 Spring / LangChain4j 等框架抽象。
 
@@ -40,6 +40,7 @@ paicli/
 │   └── Chapter7-Async_Parallel实现.md
 │   └── Chapter7.1-LLMClient开发.md
 │   └── Chapter8-Web_Search_Tool开发.md
+│   └── Chapter9-MCP开发.md
 └── src/main/java/com/paicli/
     ├── cli/
     │   ├── Main.java                  # CLI 入口 + REPL + JLine 终端 + 模式路由 + RAG 命令
@@ -101,12 +102,55 @@ paicli/
         ├── WebFetcher.java             # HTTP 抓取器（5MB 上限、30s 超时、charset 解析）
         └── ZhipuSearchProvider.java    # 智谱 Web Search provider（完整实现）
     └── hitl/
-        ├── ApprovalPolicy.java           # 危险操作静态识别（write_file / execute_command / create_project）
+        ├── ApprovalPolicy.java           # 危险操作静态识别 + MCP 工具全放行
         ├── ApprovalRequest.java          # 审批请求数据模型 + CJK-aware 终端盒子绘制
-        ├── ApprovalResult.java           # 审批决策（APPROVED / APPROVED_ALL / REJECTED / MODIFIED / SKIPPED）
-        ├── HitlHandler.java             # 审批交互接口
-        ├── HitlToolRegistry.java        # 透明 HITL 拦截层（继承 ToolRegistry）
-        └── TerminalHitlHandler.java      # 终端交互实现（y/a/n/s/m + synchronized 并发安全）
+        ├── ApprovalResult.java           # 审批决策（APPROVED / APPROVED_ALL / APPROVED_ALL_BY_SERVER / ...）
+        ├── HitlHandler.java             # 审批交互接口 + 工具/server 维度全放行
+        ├── HitlToolRegistry.java        # 透明 HITL 拦截层（继承 ToolRegistry，MCP 全放行预检）
+        └── TerminalHitlHandler.java      # 终端交互实现（y/a→子菜单/n/s/m + server 维度放行）
+    ├── mcp/
+    │   ├── McpServerStatus.java          # Server 状态枚举（STARTING/READY/DISABLED/ERROR）
+    │   ├── McpClient.java                # MCP 协议客户端（initialize + tools + resources + prompts + notifications）
+    │   ├── McpServer.java                # 单 server 状态管理
+    │   ├── McpServerManager.java         # 编排器（启动/重启/禁用/资源索引/进度打印/通知处理）
+    │   ├── config/
+    │   │   ├── McpConfigFile.java        # mcp.json 顶层 POJO
+    │   │   ├── McpServerConfig.java      # 单 server 配置（command/args/env/url/headers/disabled）
+    │   │   └── McpConfigLoader.java      # 两级配置合并 + ${VAR} 展开 + 校验
+    │   ├── jsonrpc/
+    │   │   ├── JsonRpcClient.java        # JSON-RPC 2.0 客户端（请求-响应配对 + 超时 + 通知）
+    │   │   ├── JsonRpcException.java     # JSON-RPC 异常（含 code）
+    │   │   └── JsonRpcMessage.java       # 消息 record（Request/Response/Notification/Error）
+    │   ├── transport/
+    │   │   ├── McpTransport.java         # 传输层抽象接口
+    │   │   ├── StdioTransport.java       # stdio 子进程传输（newline-delimited JSON + stderr 环形缓冲）
+    │   │   └── StreamableHttpTransport.java  # Streamable HTTP 传输（OkHttp + SSE 解析 + Session-ID）
+    │   ├── protocol/
+    │   │   ├── McpCapabilities.java      # capabilities record
+    │   │   ├── McpCallToolRequest.java   # tools/call 请求构建器
+    │   │   ├── McpCallToolResult.java    # tools/call 结果 + image fallback 引导 + formatForLlm()
+    │   │   ├── McpContent.java           # content 项 record
+    │   │   ├── McpInitializeRequest.java # initialize 请求（protocol 2025-03-26）
+    │   │   ├── McpInitializeResult.java  # initialize 响应
+    │   │   ├── McpToolDescriptor.java    # 工具描述符 + namespaced() 命名空间工厂
+    │   │   └── McpSchemaSanitizer.java   # inputSchema 清洗（去 $ref/anyOf，截断描述）
+    │   ├── resources/
+    │   │   ├── McpResourceDescriptor.java  # resource 描述 record
+    │   │   ├── McpResourceContent.java     # resource 内容 record（text/blob）
+    │   │   ├── McpResourceCache.java       # 并发缓存 + 过期追踪（server/URI 级）
+    │   │   └── McpResourceTool.java        # 虚拟工具：list_resources / read_resource
+    │   ├── mention/
+    │   │   ├── AtMentionParser.java        # @server:protocol://path 解析
+    │   │   ├── AtMentionExpander.java      # 内联展开为 <resource> XML 块
+    │   │   └── AtMentionCompleter.java     # JLine Tab 补全
+    │   └── notifications/
+    │       └── NotificationRouter.java       # 异步通知派发（防 stdout reader 死锁）
+    ├── context/
+    │   ├── ContextProfile.java            # 上下文策略（maxContextWindow → 派生所有参数）
+    │   └── TokenUsageFormatter.java       # Token 用量统计 + 按 provider 费用估算
+    ├── runtime/
+    │   ├── CancellationContext.java       # 取消上下文（ThreadLocal + 全局 fallback）
+    │   └── CancellationToken.java         # 取消令牌（原子标记 + 线程中断感知）
 └── src/main/resources/
     └── logback.xml                      # Logback 日志滚动配置
 ```
@@ -535,6 +579,73 @@ paicli/
 - **依赖**：jsoup 1.18.1（HTML 解析）
 - 详见 `docs/Chapter8-Web_Search_Tool开发.md`
 
+### 4.16 `mcp` 包 — MCP 协议集成（第 9–11 期）
+
+- 文件：`src/main/java/com/paicli/mcp/` 下 25 个类（含 config / jsonrpc / transport / protocol / resources / mention / notifications 子包）
+- **整体设计**：
+  - 三层架构：传输层（`McpTransport` + `StdioTransport` / `StreamableHttpTransport`）→ 协议层（`JsonRpcClient` + `McpClient`）→ 管理层（`McpServerManager` + `McpServer`）
+  - MCP 工具以 `mcp__{server}__{tool}` 命名空间注册到 `ToolRegistry`，与内置工具无冲突
+  - 配置文件与 Claude Code 兼容（`~/.paicli/mcp.json` + `.paicli/mcp.json` 两级合并），支持 `${VAR}` 变量展开
+  - 首次启动自动创建默认配置（含 chrome-devtools），initialize 超时 60s 可配
+  - 启动进度打印线程（每 5s 输出未就绪 server 等待时长）
+- **核心类**：
+
+| 类 | 职责 |
+|---|---|
+| `JsonRpcClient` | JSON-RPC 2.0 客户端：自增 ID 配对 `ConcurrentHashMap<id, CompletableFuture>`、daemon 超时调度器、通知监听 |
+| `McpTransport` | 传输层接口（`send` / `onReceive` / `stderrLines` / `processId` / `close`） |
+| `StdioTransport` | ProcessBuilder 子进程传输：newline-delimited JSON、stderr 环形缓冲（200 行）、优雅关闭（EOF→SIGTERM→SIGKILL） |
+| `StreamableHttpTransport` | OkHttp POST + SSE 流式响应、`Mcp-Session-Id` 会话管理、DELETE session 关闭 |
+| `McpClient` | MCP 协议客户端：initialize（握手+capabilities）、tools/list、tools/call、resources/list、resources/read、prompts/list、onNotification |
+| `McpServer` | 单 server 状态机（STARTING→READY/DISABLED/ERROR），持有 client/tools/errorMessage/startedAt |
+| `McpServerManager` | 编排器：并行启动（daemon 线程池 max 8）、restart/disable/enable/logs/resources/prompts、被动通知处理（tools/resources list_changed）、`resourceIndexForPrompt()` |
+| `McpConfigLoader` | 两级 JSON 合并 + `${HOME}` / `${PROJECT_DIR}` / `${ENV}` 展开 + `.env` 回退（System.getenv → System.getProperty） |
+| `McpSchemaSanitizer` | 清洗 `inputSchema`：去 `$schema/$id/$ref`、anyOf/oneOf 展平到 description、截断 1000 字符、保证 type/properties 存在 |
+| `McpResourceCache` | 并发缓存 + server/URI 两级过期追踪 |
+| `McpResourceTool` | 为支持 resources 的 server 注册虚拟工具 `list_resources` / `read_resource` |
+| `AtMentionParser` | 正则解析 `@server:protocol://path`，跳过引号内文本 |
+| `AtMentionExpander` | 调 `readResourceForMention()` → `<resource>` XML 内联（上限 200KB） |
+| `AtMentionCompleter` | JLine `Completer`，Tab 补全 `@server:...` |
+| `NotificationRouter` | 异步派发通知到独立 daemon 线程，防 stdout reader 自我死锁 |
+
+- **HITL 集成**：
+  - MCP 工具默认走 HITL 审批（`mcp__` 前缀 → `ApprovalPolicy.requiresApproval() = true`）
+  - Server 维度全放行：按 `a` 弹出二级菜单（tool vs server），连续浏览器操作只需确认一次
+  - `HitlToolRegistry` 继承 `ToolRegistry`，零适配成本
+- **CLI 命令**：`/mcp` `/mcp restart|logs|disable|enable <name>` `/mcp resources <name>` `/mcp prompts <name>` `/cancel`
+- **配置**：`~/.paicli/mcp.json` 或 `.paicli/mcp.json`，格式与 Claude Code `claude_desktop_config.json` 兼容
+- **依赖**：无新增（复用 Jackson + OkHttp）
+- 详见 `docs/Chapter9-MCP开发.md`
+
+### 4.17 `context` 包 — 上下文策略（第 11 期）
+
+- 文件：`src/main/java/com/paicli/context/ContextProfile.java`、`src/main/java/com/paicli/context/TokenUsageFormatter.java`
+- **整体设计**：无"长/短/平衡"模式分档，所有参数都是 `maxContextWindow` 的简单函数
+- **核心类**：
+
+| 类 | 职责 |
+|---|---|
+| `ContextProfile` | 从 `maxContextWindow` 派生：Agent token 预算（80%×window）、短期记忆预算（45%×window）、压缩阈值（90%）、MCP resource 索引启用判定（window≥32k）、prompt cache 能力声明 |
+| `TokenUsageFormatter` | 按 provider 差异化定价的费用估算（GLM: 5/1/15 ¥/M tokens，DeepSeek: 2/0.5/8），区分 cached/uncached input |
+
+- **LLM 能力声明**：`LlmClient` 接口新增 `maxContextWindow()` / `supportsPromptCaching()` / `promptCacheMode()` 默认方法；`GLMClient`（200k）和 `DeepSeekClient`（1M）分别覆写
+- **AgentBudget 动态化**：`fromLlmClient()` 按模型 window 计算预算（替代写死 300k）；新增 `totalCachedInputTokens` 统计
+- **cached token 解析**：`AbstractOpenAiCompatibleClient` 兼容 6 种 cached token 字段名（`cached_tokens` / `prompt_cache_hit_tokens` / `input_cache_hit_tokens` / `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`）
+- **MCP resource 索引注入**：`Agent.externalContextSupplier` → 调 `McpServerManager.resourceIndexForPrompt()` → 长上下文模式下自动注入 resource URI/描述到 system prompt
+
+### 4.18 `runtime` 包 — 运行时取消（第 10 期）
+
+- 文件：`src/main/java/com/paicli/runtime/CancellationContext.java`、`src/main/java/com/paicli/runtime/CancellationToken.java`
+- **核心类**：
+
+| 类 | 职责 |
+|---|---|
+| `CancellationContext` | 线程安全取消信号管理：`InheritableThreadLocal`（子线程继承）+ 全局 `AtomicReference` fallback |
+| `CancellationToken` | 原子取消标记 + `Thread.interrupted()` 感知 |
+
+- **Agent 集成**：ReAct / Plan / Team 三个 Agent 的 while 循环开始处均检查 `CancellationContext.isCancelled()`，返回 `"⏹️ 任务已取消"`
+- **CLI 集成**：`/cancel` 命令 + `Main.runTaskWithCancel()` 中 `startRun()` / `clear()` 包裹
+
 ---
 
 ## 5. 开发与运行
@@ -580,10 +691,10 @@ java -jar target/paicli-0.0.1-SNAPSHOT.jar
 | 6 | HITL 审批 | `HitlToolRegistry` / `ApprovalPolicy` / `ApprovalRequest` / `ApprovalResult` / `HitlHandler` / `TerminalHitlHandler` | 已完成 → [4.12](#412-hitl-包--hitl-审批系统第-6-期) |
 | 7 | 异步并行 | `ToolRegistry.executeTools` / `ToolInvocation` / `ToolExecutionResult` | 已完成 → [4.14](#414-toolregistry-第-7-期增强) |
 | 8 | 多模型 + 联网工具 | `LlmClient` 接口 / `AbstractOpenAiCompatibleClient` / `DeepSeekClient` / `AgentBudget` / `SearchProvider` / `ZhipuSearchProvider` / `WebFetcher` / `HtmlExtractor` / `NetworkPolicy` | 已完成 → [4.15](#415-web-包--web-search-tool-联网工具第-8-期) + `docs/Chapter7.1-LLMClient开发.md` + `docs/Chapter8-Web_Search_Tool开发.md` |
-| 9 | MCP 协议核心 | `JsonRpcClient` / `McpTransport` / `McpServerManager` | 未开始 |
-| 10–11 | MCP | `JsonRpcClient` / `McpTransport` / `McpServerManager` | 未开始 |
-| 12 | 长上下文 | `AgentBudget` / `ContextProfile` | 未开始 |
-| 13–14 | Chrome DevTools MCP | 浏览器接入 | 未开始 |
+| 9 | MCP 协议核心 | `JsonRpcClient` / `McpTransport` / `McpServerManager` / `McpClient` / `McpServer` + config + protocol records | 已完成 → [4.16](#416-mcp-包--mcp-协议集成第-9–11-期) + `docs/Chapter9-MCP开发.md` |
+| 10–11 | MCP 高级 + Chrome DevTools + 长上下文 | `McpResourceCache` / `McpResourceTool` / `AtMentionParser` / `NotificationRouter` / `CancellationContext` / `ContextProfile` / `TokenUsageFormatter` / HITL server 全放行 | 已完成 → [4.16](#416-mcp-包--mcp-协议集成第-9–11-期) + [4.17](#417-context-包--上下文策略第-11-期) + [4.18](#418-runtime-包--运行时取消第-10-期) |
+| 12 | 长上下文 | `AgentBudget` / `ContextProfile` | 已完成 ↑（合并入第 11 期） |
+| 13–14 | Chrome DevTools MCP | 浏览器接入 | 已完成 ↑（合并入第 11 期） |
 | 15 | Skill 系统 | `SkillLoader` / `SkillContextBuffer` | 未开始 |
 | 16 | TUI 产品化 | `Renderer` 接口 + inline/lanterna/plain 三实现 | 未开始 |
 | 17 | LSP 诊断 | `LspManager` / `LspHooks` | 未开始 |
