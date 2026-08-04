@@ -4,10 +4,12 @@ import com.paicli.agent.Agent;
 import com.paicli.agent.AgentOrchestrator;
 import com.paicli.agent.PlanExecuteAgent;
 import com.paicli.config.PaiCliConfig;
+import com.paicli.hitl.ApprovalPolicy;
 import com.paicli.hitl.HitlToolRegistry;
 import com.paicli.hitl.TerminalHitlHandler;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmClientFactory;
+import com.paicli.policy.AuditLog;
 import com.paicli.tool.ToolRegistry;
 import com.paicli.memory.MemoryManager;
 import com.paicli.plan.ExecutionPlan;
@@ -204,7 +206,7 @@ public class Main {
                 switch (command.type()) {
                     case UNKNOWN_COMMAND -> {
                         System.out.println("❌ 未知命令: " + command.payload());
-                        System.out.println("可用命令：/model /plan /team /hitl /clear /context /memory /memory clear /save /index /search /graph /exit\n");
+                        System.out.println("可用命令：/model /plan /team /hitl /policy /audit /clear /context /memory /memory clear /save /index /search /graph /exit\n");
                         continue;
                     }
                     case EXIT -> {
@@ -221,6 +223,14 @@ public class Main {
                         System.out.println("📋 上下文状态：");
                         System.out.println(reactAgent.getContextStatus());
                         System.out.println();
+                        continue;
+                    }
+                    case POLICY_STATUS -> {
+                        printPolicyStatus(reactAgent);
+                        continue;
+                    }
+                    case AUDIT_TAIL -> {
+                        printAuditTail(reactAgent, command.payload());
                         continue;
                     }
                     case SWITCH_MODEL -> {
@@ -742,12 +752,58 @@ public class Main {
                 "默认模式是 ReAct",
                 "输入 '/hitl on' 启用危险操作人工审批（HITL）",
                 "输入 '/hitl off' 关闭 HITL 审批",
+                "输入 '/policy' 查看安全策略状态（路径围栏 / 命令黑名单 / 资源上限）",
+                "输入 '/audit [N]' 查看最近 N 条危险工具审计记录（默认 10）",
                 "输入 '/clear' 清空对话历史",
                 "输入 '/memory' 查看记忆状态",
                 "输入 '/memory clear' 清空长期记忆",
                 "输入 '/save 事实内容' 手动保存关键事实",
                 "输入 '/exit' 或 '/quit' 退出"
         );
+    }
+
+    private static void printPolicyStatus(Agent reactAgent) {
+        System.out.println("🛡️ 安全策略状态：");
+        System.out.println("   项目根: " + reactAgent.getToolRegistry().getProjectPath());
+        System.out.println("   危险工具: " + String.join(", ", ApprovalPolicy.getDangerousTools()));
+        System.out.println("   路径围栏: 强制限定在项目根之内（read_file / write_file / list_dir / create_project）");
+        System.out.println("   命令黑名单: sudo / rm -rf 全盘 / mkfs / dd of=/dev / fork bomb / curl|sh / find / / chmod 777 / / shutdown");
+        System.out.println("   写入文件上限: 5MB");
+        System.out.println("   命令执行上限: 60 秒，输出 8KB（截断）");
+        System.out.println("   审计目录: " + reactAgent.getToolRegistry().getAuditLog().getAuditDir());
+        System.out.println();
+    }
+
+    private static void printAuditTail(Agent reactAgent, String payload) {
+        int requested = parseAuditCount(payload, 10);
+        List<AuditLog.AuditEntry> entries = reactAgent.getToolRegistry().getAuditLog().readRecent(requested);
+        if (entries.isEmpty()) {
+            System.out.println("📭 今日尚无审计记录\n");
+            return;
+        }
+        System.out.println("📋 最近 " + entries.size() + " 条危险工具审计：");
+        for (AuditLog.AuditEntry entry : entries) {
+            System.out.printf("   [%s] %s %s (%dms, approver=%s)%n",
+                    entry.outcome().toUpperCase(),
+                    entry.timestamp(),
+                    entry.tool(),
+                    entry.durationMs(),
+                    entry.approver());
+            if (entry.reason() != null && !entry.reason().isBlank()) {
+                System.out.println("        原因: " + entry.reason());
+            }
+        }
+        System.out.println();
+    }
+
+    private static int parseAuditCount(String payload, int defaultN) {
+        if (payload == null || payload.isBlank()) return defaultN;
+        try {
+            int n = Integer.parseInt(payload.trim());
+            return Math.max(1, Math.min(n, 100));
+        } catch (NumberFormatException e) {
+            return defaultN;
+        }
     }
 
     private static void printStartupHints() {
